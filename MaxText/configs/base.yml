@@ -195,6 +195,8 @@ scan_layers_per_stage: False
 set_remat_policy_on_pipeline_iterations: True
 set_remat_policy_on_layers_per_stage: False
 
+use_mmpp: False
+
 
 # Choose 'remat_policy' between 'minimal', 'save_dot_with_context_except_mlp', 'save_dot_except_mlpwi', 'save_dot_except_mlp',
 # 'save_qkv_proj', 'qkv_proj_offloaded', 'custom', 'minimal_offloaded', 'save_out_proj' and 'full'.
@@ -501,7 +503,8 @@ data_shuffle_seed: 0
 init_weights_seed: 0
 
 # You may disable clipping by setting gradient_clipping_threshold to zero.
-gradient_clipping_threshold: 1.0
+# gradient_clipping_threshold: 1.0
+gradient_clipping_threshold: 0
 
 # Instead of updating the weights every step, you may effectively use a larger
 # batch by accumulating the gradient over a set of steps.
