@@ -55,6 +55,7 @@ from vertex_tensorboard import VertexTensorboardManager
 
 from input_pipeline.input_pipeline_interface import create_data_iterator
 from layers import models
+import mmpp
 
 from gcp_workload_monitor import GCPWorkloadMonitor
 
@@ -358,15 +359,31 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
 
-  logits, intermediate_outputs = model.apply(
-      params,
-      data["inputs"],
-      data["inputs_position"],
-      decoder_segment_ids=data["inputs_segmentation"],
-      enable_dropout=config.enable_dropout if is_train else False,
-      rngs={"dropout": rng1, "params": aqt_rng},
-      mutable="intermediates",
-  )
+  rngs = {"dropout": rng1, "params": aqt_rng}
+  if config.use_mmpp:
+    logits = mmpp.apply_model(
+        model,
+        rngs,
+        params,
+        data["inputs"],
+        data["inputs_position"],
+        decoder_segment_ids=data["inputs_segmentation"],
+        enable_dropout=config.enable_dropout if is_train else False,
+    )
+    intermediate_outputs = None
+  else:
+    logits, intermediate_outputs = model.apply(
+        params,
+        data["inputs"],
+        data["inputs_position"],
+        decoder_segment_ids=data["inputs_segmentation"],
+        enable_dropout=config.enable_dropout if is_train else False,
+        rngs=rngs,
+        mutable="intermediates",
+    )
+  logits_shapes = jax.tree.map(lambda x: x.shape, logits)
+  intermediate_outputs_shapes = jax.tree.map(lambda x: x.shape, intermediate_outputs)
+  print(f'LOSS\n___{logits_shapes=}\n___{intermediate_outputs_shapes=}')
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
@@ -471,6 +488,8 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
             jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind="device"), state_mesh_shardings.opt_state),
         )
     )
+  grads_shapes = jax.tree.map(lambda x: x.shape, grads)
+  print(f'APPLY_GRADIENTS\n___{grads_shapes=}')
   new_state = state.apply_gradients(grads=grads)
 
   scalar_metrics = {
@@ -580,7 +599,10 @@ def setup_mesh_and_model(config):
 
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
-  model = Transformer(config, mesh, quant=quant)
+  if config.use_mmpp:
+    model = mmpp.MmppTransformer(config, mesh, quant)
+  else:
+    model = Transformer(config, mesh, quant=quant)
   learning_rate_schedule = max_utils.create_learning_rate_schedule(config)
   tx = optimizers.get_optimizer(config, learning_rate_schedule)
   logger = checkpointing.setup_checkpoint_logger(config)
@@ -765,13 +787,14 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    p_train_step = jax.jit(
-        functional_train,
-        in_shardings=in_shard_train,
-        out_shardings=out_shard_train,
-        static_argnums=static_argnums_train,
-        donate_argnums=donate_argnums_train,
-    )
+    # p_train_step = jax.jit(
+    #     functional_train,
+    #     in_shardings=in_shard_train,
+    #     out_shardings=out_shard_train,
+    #     static_argnums=static_argnums_train,
+    #     donate_argnums=donate_argnums_train,
+    # )
+    p_train_step = functional_train
 
     if eval_data_iterator:
       p_eval_step = jax.jit(

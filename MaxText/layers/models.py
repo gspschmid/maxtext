@@ -187,17 +187,17 @@ class Decoder(nn.Module):
 
   def setup(self):
     """Initialize decoder layer."""
-    self.decoder_layer = self.get_decoder_layers()
-    self.norm_layer = self.get_norm_layer()
+    self.decoder_layer = self.get_decoder_layers(self.config)
+    self.norm_layer = self.get_norm_layer(self.config)
     if self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer[0])
-      remat_policy = self.get_remat_policy()
+      remat_policy = self.get_remat_policy(self.config)
       self.pipeline_module = pipeline.Pipeline(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
-  def get_remat_policy(self):
-    cfg = self.config
+  @staticmethod
+  def get_remat_policy(cfg):
     if cfg.remat_policy != "none":
       if cfg.remat_policy == "minimal":
         policy = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
@@ -278,54 +278,56 @@ class Decoder(nn.Module):
       RemattedBlockLayers.append(layer)
     return RemattedBlockLayers
 
-  def get_decoder_layers(self):
-    if self.config.decoder_block == "default":
+  @staticmethod
+  def get_decoder_layers(cfg):
+    if cfg.decoder_block == "default":
       return [DecoderLayer]
-    elif self.config.decoder_block == "llama2":
+    elif cfg.decoder_block == "llama2":
       from layers import llama2
 
       return [llama2.LlamaDecoderLayer]
-    elif self.config.decoder_block == "mistral":
+    elif cfg.decoder_block == "mistral":
       # TODO(ranran): update to Mistral with sliding window attention
       from layers import mistral
 
       return [mistral.MistralDecoderLayer]
-    elif self.config.decoder_block == "deepseek":
+    elif cfg.decoder_block == "deepseek":
       from layers import deepseek
 
       return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
-    elif self.config.decoder_block == "gemma":
+    elif cfg.decoder_block == "gemma":
       from layers import gemma
 
       return [gemma.GemmaDecoderLayer]
-    elif self.config.decoder_block == "gemma2":
+    elif cfg.decoder_block == "gemma2":
       from layers import gemma2
 
       return [gemma2.Gemma2DecoderLayer]
-    elif self.config.decoder_block == "gpt3":
+    elif cfg.decoder_block == "gpt3":
       from layers import gpt3
 
       return [gpt3.Gpt3DecoderLayer]
-    elif self.config.decoder_block == "simple":
+    elif cfg.decoder_block == "simple":
       from layers import simple_layer
 
       return [simple_layer.SimpleDecoderLayer]
-    elif self.config.decoder_block == "simple_mlp":
+    elif cfg.decoder_block == "simple_mlp":
       from layers import simple_layer
 
       return [simple_layer.SimpleMlpDecoderLayer]
     else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
+      raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block=}")
 
-  def get_norm_layer(self):
-    if self.config.decoder_block in ("default", "llama2", "mistral", "deepseek", "gemma", "gemma2", "simple", "simple_mlp"):
+  @staticmethod
+  def get_norm_layer(cfg):
+    if cfg.decoder_block in ("default", "llama2", "mistral", "deepseek", "gemma", "gemma2", "simple", "simple_mlp"):
       return RMSNorm
-    elif self.config.decoder_block == "gpt3":
+    elif cfg.decoder_block == "gpt3":
       from layers import gpt3
 
       return functools.partial(gpt3.Gpt3LayerNorm, reductions_in_fp32=False, use_bias=True)
     else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
+      raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block=}")
 
   def scan_decoder_layers(self, cfg, decoder_layer, length, metdata_axis_name, mesh):
     initializing = self.is_mutable_collection("params")
@@ -358,7 +360,7 @@ class Decoder(nn.Module):
   def get_pipeline_stage_module(self, base_stage):
     cfg = self.config
     if cfg.set_remat_policy_on_layers_per_stage:
-      policy = self.get_remat_policy()
+      policy = self.get_remat_policy(self.config)
       base_stage = self.set_remat_policy([base_stage], policy)[0]
     if cfg.num_layers_per_pipeline_stage == 1:
       stage_module = base_stage(config=cfg, mesh=self.mesh, quant=self.quant)
@@ -409,7 +411,7 @@ class Decoder(nn.Module):
           config=cfg,
       )(decoder_positions)
 
-    policy = self.get_remat_policy()
+    policy = self.get_remat_policy(self.config)
     RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
 
     if cfg.using_pipeline_parallelism:
@@ -482,7 +484,7 @@ class Decoder(nn.Module):
                 model_mode,
                 page_state,
             )
-    y = self.get_norm_layer()(
+    y = self.get_norm_layer(self.config)(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="decoder_norm",
