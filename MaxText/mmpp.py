@@ -289,6 +289,4 @@ def apply_model(
         deterministic,
         model_mode,
     )
-  print(f'YYY {y.shape}')
-  print('-----')
   return y

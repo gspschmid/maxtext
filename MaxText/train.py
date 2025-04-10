@@ -382,8 +382,6 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
         mutable="intermediates",
     )
   logits_shapes = jax.tree.map(lambda x: x.shape, logits)
-  intermediate_outputs_shapes = jax.tree.map(lambda x: x.shape, intermediate_outputs)
-  print(f'LOSS\n___{logits_shapes=}\n___{intermediate_outputs_shapes=}')
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
@@ -488,8 +486,6 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
             jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind="device"), state_mesh_shardings.opt_state),
         )
     )
-  grads_shapes = jax.tree.map(lambda x: x.shape, grads)
-  print(f'APPLY_GRADIENTS\n___{grads_shapes=}')
   new_state = state.apply_gradients(grads=grads)
 
   scalar_metrics = {
