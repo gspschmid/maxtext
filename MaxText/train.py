@@ -783,16 +783,23 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    # p_train_step = jax.jit(
-    #     functional_train,
-    #     in_shardings=in_shard_train,
-    #     out_shardings=out_shard_train,
-    #     static_argnums=static_argnums_train,
-    #     donate_argnums=donate_argnums_train,
-    # )
-    p_train_step = functional_train
+    if config.use_mmpp:
+      p_train_step = mmpp.pipelined(
+        mesh,
+        functional_train,
+        (state, next(data_iterator), init_rng),
+      )
+    else:
+      p_train_step = jax.jit(
+          functional_train,
+          in_shardings=in_shard_train,
+          out_shardings=out_shard_train,
+          static_argnums=static_argnums_train,
+          donate_argnums=donate_argnums_train,
+      )
 
     if eval_data_iterator:
+      assert not config.use_mmpp
       p_eval_step = jax.jit(
           functional_eval,
           in_shardings=in_shard_eval,

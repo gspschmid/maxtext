@@ -601,6 +601,7 @@ def validate_multiple_slices(raw_keys):
 
 def set_and_validate_pipeline_config(raw_keys):
   if using_pipeline_parallelism(raw_keys):
+    stage_prefix = [] if raw_keys["use_mmpp"] else ["stage"]
 
     def modify_activation_embed_and_logits_batch(logical_axis_rules):
       for idx, logical_rule in enumerate(logical_axis_rules):
@@ -610,7 +611,7 @@ def set_and_validate_pipeline_config(raw_keys):
           # The "stage" needs to be listed first since the microbatch dimension is first before the reshape.
           logical_axis_rules[idx] = [
               "activation_embed_and_logits_batch",
-              ["stage", "data", "fsdp", "fsdp_transpose", "expert"],
+              stage_prefix + ["data", "fsdp", "fsdp_transpose", "expert"],
           ]
           break  # Exit the loop after modifying the list
       return logical_axis_rules
@@ -654,8 +655,7 @@ def set_and_validate_pipeline_config(raw_keys):
           "autoregressive",
       ]
       data_sharding = [
-          [
-              "stage",
+          stage_prefix + [
               "data",
               "fsdp",
               "fsdp_transpose",
