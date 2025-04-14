@@ -192,6 +192,7 @@ class MmppTransformer(nn.Module):
 
     return y
 
+  # NOTE: This path is used to initialize the model state.
   @nn.compact
   def __call__(
       self,
@@ -245,6 +246,7 @@ def _make_forward_section(model, stage_index):
   return jax.jit(_stage)
 
 
+# NOTE: This path is only used with mmpp.pipelined (for training steps).
 def apply_model(
     model: MmppTransformer,
     rngs,
@@ -303,6 +305,15 @@ def slice_mesh(mesh, axis_name, slice_index):
   return Mesh(devices, mesh.axis_names[:axis] + mesh.axis_names[axis+1:])
 
 
+# MmppContext provides the state for correctly transforming mmpp stages.
+# We effectively execute the MmppTransformer in three variants:
+#  1. The usual Flax way, entering via __call__. We only use this for model.init.
+#  2. A first pass in mmpp.pipelined to infer shardings and other metadata.
+#  3. A second pass in mmpp.pipelined to compile the stages separately.
+# As part of these steps, MmppContext modifies which mesh is used and whether
+# the model is broken into separate jax.jits. In particular, 1. and 2. use only
+# stage 0's mesh, but compile everything in a single jax.jit. Step 3. compiles
+# wrap's each stage in separate jax.jit and uses the appropriate meshes.
 @dataclasses.dataclass(frozen=True)
 class MmppContext:
   mesh: Mesh
@@ -339,7 +350,8 @@ class MmppContext:
 _mmpp_context: Optional[MmppContext] = None
 
 def get_context() -> MmppContext:
-  assert _mmpp_context is not None, 'MmppContext unavailable'
+  assert _mmpp_context is not None, \
+    'MmppContext unavailable. Are you calling from outside mmpp.pipelined?'
   return _mmpp_context
 
 def get_context_or_fallback(mesh: Mesh) -> MmppContext:
@@ -459,6 +471,7 @@ def pipelined(mesh, step_fn, example_inputs):
   def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
     # return section_fn
     # TODO: donate_argnums?
+    section_fn.__name__ = f"section_{section_name}"
     return jax.jit(
         section_fn,
         in_shardings=in_shardings[section_name],

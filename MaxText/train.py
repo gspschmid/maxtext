@@ -360,7 +360,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
 
   rngs = {"dropout": rng1, "params": aqt_rng}
-  if config.use_mmpp:
+  if config.use_mmpp and not config.use_mmpp_but_old_path:
     logits = mmpp.apply_model(
         model,
         rngs,
@@ -783,7 +783,7 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    if config.use_mmpp:
+    if config.use_mmpp and not config.use_mmpp_but_old_path:
       p_train_step = mmpp.pipelined(
         mesh,
         functional_train,
@@ -930,17 +930,19 @@ def train_loop(config, state=None):
   metric_logger.write_metrics(running_gcs_metrics, metrics, config.steps - 1)  # final step metrics
   max_utils.close_summary_writer(writer)
   record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    # pytype: disable=attribute-error
-    compiled = p_train_step.lower(state, example_batch, nextrng).compile()
-    compiled_stats = compiled.memory_analysis()
-    if compiled_stats is not None:
-      max_logging.log(
-          f"Output size: {compiled_stats.output_size_in_bytes}, "
-          f"temp size: {compiled_stats.temp_size_in_bytes}, "
-          f"argument size: {compiled_stats.argument_size_in_bytes}, "
-          f"host temp size: {compiled_stats.host_temp_size_in_bytes}, in bytes."
-      )
+
+  if not config.use_mmpp:
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      # pytype: disable=attribute-error
+      compiled = p_train_step.lower(state, example_batch, nextrng).compile()
+      compiled_stats = compiled.memory_analysis()
+      if compiled_stats is not None:
+        max_logging.log(
+            f"Output size: {compiled_stats.output_size_in_bytes}, "
+            f"temp size: {compiled_stats.temp_size_in_bytes}, "
+            f"argument size: {compiled_stats.argument_size_in_bytes}, "
+            f"host temp size: {compiled_stats.host_temp_size_in_bytes}, in bytes."
+        )
   return state
 
 

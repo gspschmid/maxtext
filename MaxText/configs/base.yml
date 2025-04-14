@@ -183,6 +183,7 @@ set_remat_policy_on_pipeline_iterations: True
 set_remat_policy_on_layers_per_stage: False
 
 use_mmpp: False
+use_mmpp_but_old_path: False
 
 
 # Choose 'remat_policy' between 'minimal', 'save_dot_with_context_except_mlp', 'save_dot_except_mlpwi', 'save_dot_except_mlp',
