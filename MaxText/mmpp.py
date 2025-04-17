@@ -157,7 +157,7 @@ def test_sharding_extractor():
 
 
 def pipelined(mesh, step_fn, example_inputs):
-  # Phase 1: Infer shardings and other metadata
+  # Phase 1: Infer shardings
   print('PHASE1')
 
   dump_shardings = sharding_extractor()
@@ -199,7 +199,9 @@ def pipelined(mesh, step_fn, example_inputs):
   print('PHASE2')
 
   def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
-    # TODO: donate_argnums?
+    # TODO: donate_argnums? (-> saved_input_vjp to ensure we don't capture params?)
+    # TODO: Drop unused inputs (and outputs)? (-> could also just split params?)
+    # TODO: Rewrite shardings from stage0_mesh to the appropriate stage mesh
     return jax.jit(
         section_fn,
         in_shardings=in_shardings[section_name],
