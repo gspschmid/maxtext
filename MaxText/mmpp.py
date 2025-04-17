@@ -159,6 +159,7 @@ def test_sharding_extractor():
 def pipelined(mesh, step_fn, example_inputs):
   # Phase 1: Infer shardings and other metadata
   print('PHASE1')
+
   dump_shardings = sharding_extractor()
   in_shardings_thunk = {}
   out_shardings_thunk = {}
@@ -197,74 +198,12 @@ def pipelined(mesh, step_fn, example_inputs):
   # Phase 2: Produce final jitted sections
   print('PHASE2')
 
-  # # Imposes shardings on the inputs and output of fun.
-  # #
-  # # We need this because jax.jit(fun, out_shardings=...) doesn't quite do what
-  # # we want: we expect forward funs to return a vjp wrapper that packages the
-  # # corresponding backward function. But out_shardings is tree-mapped against
-  # # fun's actual output, so the pytrees *must* have the exact same metadata.
-  # # This seems infeasible, since we infer out_shardings from a first tracing of
-  # # fun and then want to impose it via jit, which will re-trace and thus always
-  # # produce distinct metadata. The analogous problem occurs with in_shardings
-  # # when jitting the backward function.
-  # #
-  # # Instead we use the fact that the shardings resulted from tracing the same
-  # # functions, so the flattened shardings are correct -- it's just the pytree
-  # # metadata we need to discard. Hence our workaround is to rebuild the
-  # # shardings pytree using the re-traced functions in_tree and out_tree.
-  # #
-  # # Note that {in,out}_shardings cannot merely be prefixes of the actual inputs
-  # # and outputs as jax.jit usually allows.
-  # def with_in_out_shardings(fun, in_shardings, out_shardings):
-  #   @functools.wraps(fun)
-  #   def wrapper(*args):
-  #     in_flat, in_tree = jax.tree.flatten(args)
-  #     in_shardings_flat, _ = jax.tree.flatten(in_shardings)
-  #     # I'm feeling lucky.
-  #     assert len(in_flat) == len(in_shardings_flat)
-  #     in_flat = [
-  #       jax.lax.with_sharding_constraint(inval, in_sharding)
-  #       for inval, in_sharding in zip(in_flat, in_shardings_flat)
-  #     ]
-  #     args = jax.tree.unflatten(in_tree, in_flat)
-
-  #     out = fun(*args)
-
-  #     out_flat, out_tree = jax.tree.flatten(out)
-  #     out_shardings_flat, _ = jax.tree.flatten(out_shardings)
-  #     # I'm feeling lucky.
-  #     assert len(out_flat) == len(out_shardings_flat)
-  #     out_flat = [
-  #       jax.lax.with_sharding_constraint(outval, out_sharding)
-  #       for outval, out_sharding in zip(out_flat, out_shardings_flat)
-  #     ]
-  #     out = jax.tree.unflatten(out_tree, out_flat)
-  #     return out
-  #   return wrapper
-
   def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
-    # # return section_fn
-    # # TODO: donate_argnums?
-    # # section_fn.__name__ = f"section_{section_name}"
-    # section_fn = with_in_out_shardings(
-    #     section_fn,
-    #     in_shardings[section_name],
-    #     out_shardings[section_name],
-    # )
-    _in_shardings = in_shardings[section_name]
-    _out_shardings = out_shardings[section_name]
-    # # TODO: Remove this manual plumbing. Replace by utilities in fwd and bwd
-    # # that does something like `res[1] = vjp_unpack(res[1])` in the forward
-    # # and `args[0] = vjp_pack(args[0])` and replaces the sharding pytree for
-    # # the first component by `None``.
-    # if section_name.startswith("forward"):
-    #   _out_shardings = _out_shardings[:1] + (None,) + _out_shardings[2:]
-    # if section_name.startswith("backward"):
-    #   _in_shardings = (None,) + _in_shardings[1:]
+    # TODO: donate_argnums?
     return jax.jit(
         section_fn,
-        in_shardings=_in_shardings,
-        out_shardings=_out_shardings,
+        in_shardings=in_shardings[section_name],
+        out_shardings=out_shardings[section_name],
         static_argnums=static_argnums,
     )
 
