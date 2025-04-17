@@ -1,293 +1,3 @@
-"""MmppTransformer.
-Derived from layers/models.py while dropping support for various configs."""
-
-from functools import lru_cache, partial
-from typing import Callable, Optional
-
-from flax import linen as nn
-import jax
-import jax.numpy as jnp
-import common_types
-from layers import embeddings
-from layers import linears
-from layers import models
-from layers import quantizations
-
-Config = common_types.Config
-Mesh = common_types.Mesh
-ScanIn = common_types.ScanIn
-
-Embed = embeddings.Embed
-Quant = quantizations.AqtQuantization
-
-
-class MmppTransformer(nn.Module):
-  """Transformer, specialized for mmpp."""
-  config: Config
-  mesh: Mesh
-  quant: Quant
-
-  def setup(self):
-    cfg = self.config
-    assert cfg.using_pipeline_parallelism and cfg.use_mmpp
-    assert not cfg.use_untrainable_positional_embedding  # straightforward embedding
-    assert not cfg.trainable_position_size > 0
-    assert not cfg.logits_via_embedding                  # no shared embedding
-    assert not cfg.set_remat_policy_on_layers_per_stage  # we control remat manually
-    assert cfg.scan_layers
-
-    decoder_layers = models.Decoder.get_decoder_layers(cfg)
-    assert len(decoder_layers), f"unsupported decoder block: {cfg.decoder_block}"
-    self.decoder_layer = decoder_layers[0]
-
-  @property
-  def num_logical_stages(self):
-    cfg = self.config
-    return cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
-
-  def scan_decoder_layers(self, cfg, mesh, decoder_layer, length, metdata_axis_name):
-    initializing = self.is_mutable_collection("params")
-    params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
-    cache_spec = 0
-    scan_fn = nn.scan(
-        decoder_layer,
-        variable_axes={
-            "params": params_spec,
-            "cache": cache_spec,
-            "intermediates": 0,
-            "aqt": 0,
-            "_overwrite_with_gradient": 0,
-        },
-        split_rngs={
-            "params": True,
-            "dropout": cfg.enable_dropout,
-        },
-        in_axes=(
-            nn.broadcast,
-            nn.broadcast,
-            nn.broadcast,
-            nn.broadcast,
-        ),
-        length=length,
-        metadata_params={nn.PARTITION_NAME: metdata_axis_name},
-    )
-    return scan_fn(config=cfg, mesh=mesh, name=metdata_axis_name, quant=self.quant)
-
-  def get_pipeline_stage_module(self, stage_index, base_stage, num_layers_in_stage):
-    cfg = self.config
-    mesh = get_context_or_fallback(self.mesh).get_stage_mesh(stage_index)
-    name = f"stage{stage_index}_layers"
-    if num_layers_in_stage == 1:
-      stage_module = base_stage(config=cfg, mesh=mesh, quant=self.quant, name=name)
-    else:
-      stage_module = self.scan_decoder_layers(
-          cfg, mesh, base_stage, num_layers_in_stage, name
-      )
-    return stage_module
-
-  @nn.compact
-  def _embedding(
-      self,
-      decoder_input_tokens,
-      deterministic,
-  ):
-    cfg = self.config
-
-    # [batch, length] -> [batch, length, emb_dim]
-    y = Embed(
-        num_embeddings=cfg.vocab_size,
-        features=cfg.emb_dim,
-        dtype=cfg.dtype,
-        attend_dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,
-        embedding_init=nn.initializers.normal(stddev=1.0),
-        name="token_embedder",
-        config=cfg,
-    )(decoder_input_tokens.astype("int32"))
-    y = nn.Dropout(
-        rate=cfg.dropout_rate,
-        broadcast_dims=(-2,),
-        name="embedding_dropout",
-    )(y, deterministic=deterministic)
-    y = y.astype(cfg.dtype)
-
-    return y
-
-  @nn.compact
-  def _logits(self, y, deterministic):
-    cfg = self.config
-
-    y = models.Decoder.get_norm_layer(cfg)(
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        name="decoder_norm",
-        epsilon=cfg.normalization_layer_epsilon,
-        kernel_axes=("norm",),
-    )(y)
-    y = nn.Dropout(
-        rate=cfg.dropout_rate,
-        broadcast_dims=(-2,),
-        name="logits_dropout",
-    )(y, deterministic=deterministic)
-
-    # [batch, length, emb_dim] -> [batch, length, vocab_size]
-    logits = linears.DenseGeneral(
-        cfg.vocab_size,
-        weight_dtype=cfg.weight_dtype,
-        dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
-        kernel_axes=("embed", "vocab"),
-        name="logits_dense",
-        matmul_precision=cfg.matmul_precision,
-    )(y)  # We do not quantize the logits matmul.
-    logits = nn.with_logical_constraint(
-        logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
-    )
-    if cfg.cast_logits_to_fp32:
-      logits = logits.astype(jnp.float32)
-    return logits
-
-  @nn.compact
-  def _stage(self, stage_index, y, decoder_segment_ids, decoder_positions):
-    cfg = self.config
-
-    # NOTE: Fixed to avoid the need for static args:
-    deterministic = True
-    model_mode = common_types.MODEL_MODE_TRAIN
-
-    ## If first stage: embedding
-    if stage_index == 0:
-      decoder_input_tokens = y
-      y = self._embedding(decoder_input_tokens, deterministic)
-
-    ## Layers
-    num_layers_per_stage, rem = divmod(cfg.num_decoder_layers, self.num_logical_stages)
-    assert 0 <= stage_index < self.num_logical_stages
-
-    num_layers_per_stage += 1 if stage_index < rem else 0
-    layer_module = self.decoder_layer
-    if stage_index != self.num_logical_stages - 1:
-      # Remat all but the last stage
-      layer_module = nn.remat(
-          layer_module,
-          prevent_cse=not cfg.scan_layers,
-          policy=models.Decoder.get_remat_policy(cfg),
-          static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
-      )
-    stage_module = self.get_pipeline_stage_module(
-        stage_index,
-        layer_module,
-        num_layers_per_stage,
-    )
-    y = stage_module(
-      y,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-    )
-    y = y[0] if cfg.scan_layers else y
-
-    ## If last stage: logits
-    if stage_index == self.num_logical_stages - 1:
-      y = self._logits(y, deterministic)
-
-    return y
-
-  # NOTE: This path is used to initialize the model state.
-  @nn.compact
-  def __call__(
-      self,
-      decoder_input_tokens,
-      decoder_positions,
-      decoder_segment_ids=None,
-      enable_dropout=False,
-      model_mode=common_types.MODEL_MODE_TRAIN,
-      previous_chunk=None,
-      true_length: Optional[int] = None,
-      slot: Optional[int] = None,
-  ):
-    """The transformer implemented in the usual flax way (unusable for mmpp)."""
-    assert enable_dropout == False  # ~> deterministic = True
-    assert model_mode == common_types.MODEL_MODE_TRAIN
-    del previous_chunk
-    del true_length
-    del slot
-    del enable_dropout
-    del model_mode
-
-    y = decoder_input_tokens
-    for stage_index in range(self.num_logical_stages):
-      y = self._stage(
-          stage_index,
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-      )
-    return y
-
-
-# TODO: CLEANUP
-def _make_forward_section(model, stage_index):
-  def _stage(
-      rngs,
-      params,
-      y,
-      decoder_positions,
-      decoder_segment_ids,
-  ):
-    return model.apply(
-      params,
-      stage_index,
-      y,
-      decoder_positions,
-      decoder_segment_ids,
-      rngs=rngs,
-      method=model._stage,
-    )
-  return jax.jit(_stage)
-
-
-# NOTE: This path is only used with mmpp.pipelined (for training steps).
-def apply_model(
-    model: MmppTransformer,
-    rngs,
-    params,
-    # The usual __call__ arguments:
-    decoder_input_tokens,
-    decoder_positions,
-    decoder_segment_ids=None,
-    enable_dropout=False,
-    model_mode=common_types.MODEL_MODE_TRAIN,
-    previous_chunk=None,
-    true_length: Optional[int] = None,
-    slot: Optional[int] = None,
-):
-  """The transformed implemented using mini_mpmd."""
-  assert enable_dropout == False  # ~> deterministic = True
-  assert model_mode == common_types.MODEL_MODE_TRAIN
-  del previous_chunk
-  del true_length
-  del slot
-  del enable_dropout
-  del model_mode
-
-  y = decoder_input_tokens
-  ctx = get_context()
-  for stage_index in range(model.num_logical_stages):
-    y = ctx.section(
-        f"forward{stage_index}",
-        partial(_make_forward_section, model, stage_index),
-    )(
-        rngs,
-        params,
-        y,
-        decoder_segment_ids,
-        decoder_positions,
-    )
-  return y
-
-
-###
-
 import contextlib
 import dataclasses
 import functools
@@ -332,13 +42,12 @@ class MmppContext:
   def section(
       self,
       name: str,
-      make_section_fn: Callable[..., Callable],
+      section_fn: Callable,
       **kwargs,
   ) -> Callable:
     """Annotates a section and caches the resulting function."""
     assert self.section_decorator
     if name not in self.section_cache:
-      section_fn = make_section_fn()
       self.section_cache[name] = self.section_decorator(name, section_fn, **kwargs)
     return self.section_cache[name]
 
@@ -371,14 +80,33 @@ def set_context(ctx: MmppContext):
 
 
 def sharding_extractor():
+  def should_infer_sharding(x):
+    try:
+      aval = jax.core.get_aval(x)
+      return type(aval) is jax.core.ShapedArray
+    except TypeError:
+      return False
+
+  def is_not_jax_partial(x):
+    # We carefully separate jax Partials from their data, so that
+    # even when the function in the metadata changes due to re-tracing
+    # we can specify in and out shardings via flattened pytrees. In this
+    # setting the remaining Partials' pytree children are merely dummy
+    # values. This allows us to eliminate the Partials from the sharding
+    # prefix pytrees.
+    return x is None or isinstance(x, jax._src.tree_util.Partial)
+
   def store(shardings, index, sharding):
     shardings[index] = sharding
 
   def register_store_callbacks(xs):
-    xs_flat, xs_tree = jax.tree.flatten(xs)
+    xs_flat, xs_tree = jax.tree.flatten(xs, is_leaf=is_not_jax_partial)
     shardings = [None] * len(xs_flat)
     for index, x in enumerate(xs_flat):
-      inspect_array_sharding(x, callback=functools.partial(store, shardings, index))
+      if should_infer_sharding(x):
+        inspect_array_sharding(x, callback=functools.partial(store, shardings, index))
+      else:
+        shardings[index] = None
     return shardings, xs_tree
 
   # TODO: Add support for static args (e.g. via linear_util.WrappedFun)
@@ -468,14 +196,75 @@ def pipelined(mesh, step_fn, example_inputs):
 
   # Phase 2: Produce final jitted sections
   print('PHASE2')
+
+  # # Imposes shardings on the inputs and output of fun.
+  # #
+  # # We need this because jax.jit(fun, out_shardings=...) doesn't quite do what
+  # # we want: we expect forward funs to return a vjp wrapper that packages the
+  # # corresponding backward function. But out_shardings is tree-mapped against
+  # # fun's actual output, so the pytrees *must* have the exact same metadata.
+  # # This seems infeasible, since we infer out_shardings from a first tracing of
+  # # fun and then want to impose it via jit, which will re-trace and thus always
+  # # produce distinct metadata. The analogous problem occurs with in_shardings
+  # # when jitting the backward function.
+  # #
+  # # Instead we use the fact that the shardings resulted from tracing the same
+  # # functions, so the flattened shardings are correct -- it's just the pytree
+  # # metadata we need to discard. Hence our workaround is to rebuild the
+  # # shardings pytree using the re-traced functions in_tree and out_tree.
+  # #
+  # # Note that {in,out}_shardings cannot merely be prefixes of the actual inputs
+  # # and outputs as jax.jit usually allows.
+  # def with_in_out_shardings(fun, in_shardings, out_shardings):
+  #   @functools.wraps(fun)
+  #   def wrapper(*args):
+  #     in_flat, in_tree = jax.tree.flatten(args)
+  #     in_shardings_flat, _ = jax.tree.flatten(in_shardings)
+  #     # I'm feeling lucky.
+  #     assert len(in_flat) == len(in_shardings_flat)
+  #     in_flat = [
+  #       jax.lax.with_sharding_constraint(inval, in_sharding)
+  #       for inval, in_sharding in zip(in_flat, in_shardings_flat)
+  #     ]
+  #     args = jax.tree.unflatten(in_tree, in_flat)
+
+  #     out = fun(*args)
+
+  #     out_flat, out_tree = jax.tree.flatten(out)
+  #     out_shardings_flat, _ = jax.tree.flatten(out_shardings)
+  #     # I'm feeling lucky.
+  #     assert len(out_flat) == len(out_shardings_flat)
+  #     out_flat = [
+  #       jax.lax.with_sharding_constraint(outval, out_sharding)
+  #       for outval, out_sharding in zip(out_flat, out_shardings_flat)
+  #     ]
+  #     out = jax.tree.unflatten(out_tree, out_flat)
+  #     return out
+  #   return wrapper
+
   def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
-    # return section_fn
-    # TODO: donate_argnums?
-    section_fn.__name__ = f"section_{section_name}"
+    # # return section_fn
+    # # TODO: donate_argnums?
+    # # section_fn.__name__ = f"section_{section_name}"
+    # section_fn = with_in_out_shardings(
+    #     section_fn,
+    #     in_shardings[section_name],
+    #     out_shardings[section_name],
+    # )
+    _in_shardings = in_shardings[section_name]
+    _out_shardings = out_shardings[section_name]
+    # # TODO: Remove this manual plumbing. Replace by utilities in fwd and bwd
+    # # that does something like `res[1] = vjp_unpack(res[1])` in the forward
+    # # and `args[0] = vjp_pack(args[0])` and replaces the sharding pytree for
+    # # the first component by `None``.
+    # if section_name.startswith("forward"):
+    #   _out_shardings = _out_shardings[:1] + (None,) + _out_shardings[2:]
+    # if section_name.startswith("backward"):
+    #   _in_shardings = (None,) + _in_shardings[1:]
     return jax.jit(
         section_fn,
-        in_shardings=in_shardings[section_name],
-        out_shardings=out_shardings[section_name],
+        in_shardings=_in_shardings,
+        out_shardings=_out_shardings,
         static_argnums=static_argnums,
     )
 

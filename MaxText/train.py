@@ -55,7 +55,9 @@ from vertex_tensorboard import VertexTensorboardManager
 
 from input_pipeline.input_pipeline_interface import create_data_iterator
 from layers import models
+
 import mmpp
+import mmpp_train
 
 from gcp_workload_monitor import GCPWorkloadMonitor
 
@@ -360,27 +362,15 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
 
   rngs = {"dropout": rng1, "params": aqt_rng}
-  if config.use_mmpp and not config.use_mmpp_but_old_path:
-    logits = mmpp.apply_model(
-        model,
-        rngs,
-        params,
-        data["inputs"],
-        data["inputs_position"],
-        decoder_segment_ids=data["inputs_segmentation"],
-        enable_dropout=config.enable_dropout if is_train else False,
-    )
-    intermediate_outputs = None
-  else:
-    logits, intermediate_outputs = model.apply(
-        params,
-        data["inputs"],
-        data["inputs_position"],
-        decoder_segment_ids=data["inputs_segmentation"],
-        enable_dropout=config.enable_dropout if is_train else False,
-        rngs=rngs,
-        mutable="intermediates",
-    )
+  logits, intermediate_outputs = model.apply(
+      params,
+      data["inputs"],
+      data["inputs_position"],
+      decoder_segment_ids=data["inputs_segmentation"],
+      enable_dropout=config.enable_dropout if is_train else False,
+      rngs=rngs,
+      mutable="intermediates",
+  )
   logits_shapes = jax.tree.map(lambda x: x.shape, logits)
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
@@ -596,7 +586,7 @@ def setup_mesh_and_model(config):
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
   if config.use_mmpp:
-    model = mmpp.MmppTransformer(config, mesh, quant)
+    model = mmpp_train.MmppTransformer(config, mesh, quant)
   else:
     model = Transformer(config, mesh, quant=quant)
   learning_rate_schedule = max_utils.create_learning_rate_schedule(config)
@@ -745,6 +735,8 @@ def train_loop(config, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
+  _train_step = mmpp_train.train_step if config.use_mmpp else train_step
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -752,7 +744,7 @@ def train_loop(config, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(_train_step, mesh, state_mesh_shardings, model, config)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -783,7 +775,7 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    if config.use_mmpp and not config.use_mmpp_but_old_path:
+    if config.use_mmpp:
       p_train_step = mmpp.pipelined(
         mesh,
         functional_train,
