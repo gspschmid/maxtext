@@ -87,7 +87,7 @@ def sharding_extractor():
     except TypeError:
       return False
 
-  def is_not_jax_partial(x):
+  def is_jax_partial(x):
     # We carefully separate jax Partials from their data, so that
     # even when the function in the metadata changes due to re-tracing
     # we can specify in and out shardings via flattened pytrees. In this
@@ -100,7 +100,7 @@ def sharding_extractor():
     shardings[index] = sharding
 
   def register_store_callbacks(xs):
-    xs_flat, xs_tree = jax.tree.flatten(xs, is_leaf=is_not_jax_partial)
+    xs_flat, xs_tree = jax.tree.flatten(xs, is_leaf=is_jax_partial)
     shardings = [None] * len(xs_flat)
     for index, x in enumerate(xs_flat):
       if should_infer_sharding(x):

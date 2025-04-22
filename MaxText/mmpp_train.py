@@ -42,7 +42,7 @@ class MmppTransformer(nn.Module):
     assert cfg.scan_layers
 
     decoder_layers = models.Decoder.get_decoder_layers(cfg)
-    assert len(decoder_layers), f"unsupported decoder block: {cfg.decoder_block}"
+    assert len(decoder_layers) == 1, f"unsupported decoder block: {cfg.decoder_block}"
     self.decoder_layer = decoder_layers[0]
 
   @property

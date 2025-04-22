@@ -371,7 +371,6 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       rngs=rngs,
       mutable="intermediates",
   )
-  logits_shapes = jax.tree.map(lambda x: x.shape, logits)
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
