@@ -7,6 +7,8 @@ from typing import Callable, Optional, Sequence
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
+import optax
+
 import common_types
 from layers import embeddings
 from layers import linears
@@ -25,6 +27,8 @@ Quant = quantizations.AqtQuantization
 
 EPS = 1e-8
 
+
+### The flax model definition
 
 class MmppTransformer(nn.Module):
   """Transformer, specialized for mmpp."""
@@ -231,7 +235,6 @@ class MmppTransformer(nn.Module):
 
 
 def loss_and_aux_from_logits(config, data, logits):
-  logits_shapes = jax.tree.map(lambda x: x.shape, logits)
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
@@ -249,6 +252,8 @@ def loss_and_aux_from_logits(config, data, logits):
   }
   return loss, aux
 
+
+### Define each stage's forward and backward as separate jittable functions
 
 def forward(
     model,
@@ -361,8 +366,99 @@ def get_fwd_and_bwds(model):
   return _fwd_and_bwds_cache[1]
 
 
-def value_and_grad(model, params, data, dropout_rng):
-  ctx = mmpp.get_context()
+### Managing flax state
+
+def split_params_by_stage(num_logical_stages, all_params):
+  # Assumption: no params are shared between stages; we specialize to MmppTransformer.
+  params_by_stage = []
+  _all_params = all_params["params"]
+  for stage_index in range(num_logical_stages):
+    _params = {}
+    layers_name = f"stage{stage_index}_layers"
+    _params[layers_name] = _all_params[layers_name]
+    if stage_index == 0:
+      _params["token_embedder"] = _all_params["token_embedder"]
+    if stage_index == num_logical_stages - 1:
+      _params["decoder_norm"] = _all_params["decoder_norm"]
+      _params["logits_dense"] = _all_params["logits_dense"]
+    params_by_stage.append({"params": _params})
+  return params_by_stage
+
+
+def combine_params_by_stage(params_by_stage):
+  _params = {}
+  all_params = {"params": _params}
+  for params in params_by_stage:
+    for key, value in params["params"].items():
+      assert key not in _params, f"{key=} already present"
+      _params[key] = value
+  return all_params
+
+
+def split_opt_state_by_stage(num_stages, opt_state):
+  # Assumption: Optimizer state consists of mu and nu.
+  # https://flax-linen.readthedocs.io/en/latest/guides/model_inspection/model_surgery.html#surgery-with-optimizers
+  mu_by_stage = split_params_by_stage(num_stages, opt_state[0].mu)
+  nu_by_stage = split_params_by_stage(num_stages, opt_state[0].nu)
+  opt_state_by_stage = [
+    tuple_update(opt_state, 0, opt_state[0]._replace(mu=mu, nu=nu))
+    for mu, nu in zip(mu_by_stage, nu_by_stage)
+  ]
+  return opt_state_by_stage
+
+
+def combine_opt_state_by_stage(opt_state_by_stage):
+  _opt_state0 = opt_state_by_stage[0][0]._replace(
+    mu=combine_params_by_stage([opt_state[0].mu for opt_state in opt_state_by_stage]),
+    nu=combine_params_by_stage([opt_state[0].nu for opt_state in opt_state_by_stage]),
+  )
+  # Note: Assuming that all components except for opt_state[0] are the same.
+  return tuple_update(opt_state_by_stage[0], 0, _opt_state0)
+
+
+def update_stage_state(tx, params, opt_state, grads):
+  # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
+  assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
+  updates, new_opt_state = tx.update(grads, opt_state, params)
+  new_params = optax.apply_updates(params, updates)
+  return new_params, new_opt_state
+
+
+# update_state is the stage-sharded equivalent of
+#   new_state = old_state.apply_gradients(grads=grads)
+#
+# To work around flax and optax's API and complexity of cross-stage sharding we
+# make some heavy-handed assumptions here:
+# - params are owned by exactly one stage (i.e. no weight sharing across stages)
+# - optimizer state is sharded analogously (no cross-stage dependencies)
+def update_state(ctx, old_state, grads_by_stage):
+  num_stages = len(grads_by_stage)
+  params_by_stage = split_params_by_stage(num_stages, old_state.params)
+  opt_state_by_stage = split_opt_state_by_stage(num_stages, old_state.opt_state)
+
+  new_params_by_stage = []
+  new_opt_state_by_stage = []
+  _update_stage_state = partial(update_stage_state, old_state.tx)
+  for stage_index, (params, opt_state, grads) in enumerate(zip(params_by_stage, opt_state_by_stage, grads_by_stage)):
+    name = (mmpp.SectionKind.Epilogue, stage_index)
+    new_params, new_opt_state = ctx.section(name, _update_stage_state)(
+        params,
+        opt_state,
+        grads,
+    )
+    new_params_by_stage.append(new_params)
+    new_opt_state_by_stage.append(new_opt_state)
+
+  return old_state.replace(
+      step=old_state.step + 1,
+      params=combine_params_by_stage(new_params_by_stage),
+      opt_state=combine_opt_state_by_stage(new_opt_state_by_stage),
+  )
+
+
+### Loop over stages and train step
+
+def value_and_grad(ctx, model, params_by_stage, data, dropout_rng):
   num_stages = model.num_logical_stages
   fwd_and_bwds = get_fwd_and_bwds(model)
 
@@ -370,9 +466,10 @@ def value_and_grad(model, params, data, dropout_rng):
   stashed = [None] * num_stages
   for stage_index in range(num_stages):
     fwd, _ = fwd_and_bwds[stage_index]
+    name = (mmpp.SectionKind.Forward, stage_index)
     print(f"FWD {fwd.__name__}")
-    res = ctx.section(fwd.__name__, fwd)(
-        params,
+    res = ctx.section(name, fwd)(
+        params_by_stage[stage_index],
         act,
         data,
         dropout_rng,
@@ -381,35 +478,25 @@ def value_and_grad(model, params, data, dropout_rng):
       act, stashed[stage_index], aux = res
     else:
       act, stashed[stage_index] = res
+    # if not mmpp.get_context().use_stage0_mesh_only:
+    #   print(f"  -> {act.sharding.spec=} / devices={act.sharding.mesh._flat_devices_tuple}")
   loss = act
 
   cot_act = jnp.ones(loss.shape)
-  grads = jax.tree.map(jnp.zeros_like, params)
+  grads_by_stage = [None] * num_stages
   for stage_index in reversed(range(num_stages)):
     _, bwd = fwd_and_bwds[stage_index]
+    name = (mmpp.SectionKind.Backward, stage_index)
     print(f"BWD {bwd.__name__}")
-    stage_grads, cot_act = ctx.section(bwd.__name__, bwd)(
+    grads_by_stage[stage_index], cot_act = ctx.section(name, bwd)(
         stashed[stage_index],
         cot_act,
     )
-    grads = jax.tree.map(jnp.add, grads, stage_grads)
 
-  return (loss, aux), grads
+  return (loss, aux), grads_by_stage
 
 
 def train_step(model, config, _state_mesh_shardings, state, data, dropout_rng):
-  """
-
-  Args:
-    model: A nn.Module
-    state: A pytree of the current state of the model
-    data: Batch of data to apply to the model
-    dropout_rng: A key to use to generate rng for dropout
-
-  Returns:
-    new_state: Same format as state.
-    metrics: Dictionary of model metrics such as loss, training rate, etc.
-  """
   assert config is model.config
   assert not config.gradient_clipping_threshold > 0
   assert not config.optimizer_memory_host_offload
@@ -418,10 +505,15 @@ def train_step(model, config, _state_mesh_shardings, state, data, dropout_rng):
   assert not config.record_internal_nn_metrics
   assert not config.enable_dropout
 
-  (loss, aux), grads = value_and_grad(model, state.params, data, dropout_rng)
+  ctx = mmpp.get_context()
+  num_stages = model.num_logical_stages
 
-  # TODO: Tease apart via model state surgery
-  new_state = state.apply_gradients(grads=grads)
+  # print("BEFORE SPLIT", jax.tree.map(lambda x: x.shape, state.params))
+  params_by_stage = split_params_by_stage(num_stages, state.params)
+  # print("AFTER SPLIT", jax.tree.map(lambda x: x.shape, params_by_stage))
+  (loss, aux), grads_by_stage = value_and_grad(
+      ctx, model, params_by_stage, data, dropout_rng)
+  new_state = update_state(ctx, state, grads_by_stage)
 
   scalar_metrics = {
       "learning/loss": loss,
@@ -432,5 +524,4 @@ def train_step(model, config, _state_mesh_shardings, state, data, dropout_rng):
       "scalar": scalar_metrics,
       "scalars": {},
   }
-
   return new_state, metrics

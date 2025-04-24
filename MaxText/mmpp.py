@@ -1,5 +1,8 @@
+"""Non-model-specific code for mmpp."""
+
 import contextlib
 import dataclasses
+from enum import Enum
 import functools
 from typing import Callable, Optional
 
@@ -15,6 +18,16 @@ def slice_mesh(mesh, axis_name, slice_index):
   return Mesh(devices, mesh.axis_names[:axis] + mesh.axis_names[axis+1:])
 
 
+def get_stage_mesh(global_mesh: Mesh, stage_index: int) -> Mesh:
+  num_physical_stages = global_mesh.shape["stage"]
+  return slice_mesh(global_mesh, "stage", stage_index % num_physical_stages)
+
+
+SectionKind = Enum('SectionKind', 'Prologue Forward Backward Epilogue')
+StageIndex = int
+SectionName = tuple[SectionKind, StageIndex]
+
+
 # MmppContext provides the state for correctly transforming mmpp stages.
 # We effectively execute the MmppTransformer in three variants:
 #  1. The usual Flax way, entering via __call__. We only use this for model.init.
@@ -28,30 +41,31 @@ def slice_mesh(mesh, axis_name, slice_index):
 class MmppContext:
   mesh: Mesh
   use_stage0_mesh_only: bool
-  section_decorator: Optional[Callable[[str, Callable], Callable]]
-  section_cache: dict[str, Callable] = dataclasses.field(default_factory=dict)
+  section_decorator: Optional[Callable[[SectionName, Callable], Callable]]
+  section_cache: dict[SectionName, Callable] = dataclasses.field(default_factory=dict)
 
   def __post_init__(self):
     assert "stage" in self.mesh.axis_names
 
   def get_stage_mesh(self, stage_index: int) -> Mesh:
     slice_index = 0 if self.use_stage0_mesh_only else stage_index
-    num_physical_stages = self.mesh.shape["stage"]
-    return slice_mesh(self.mesh, "stage", slice_index % num_physical_stages)
+    return get_stage_mesh(self.mesh, slice_index)
 
+  # TODO: Refactor to pass section_fns into pipelined(...) and then only invoke section(name)(*args).
   def section(
       self,
-      name: str,
+      name: SectionName,
       section_fn: Callable,
       **kwargs,
   ) -> Callable:
-    """Annotates a section and caches the resulting function."""
+    """Annotates a section and caches the resulting function.
+    It is the caller's obligation to always pass the same section_fn for a given name."""
     assert self.section_decorator
     if name not in self.section_cache:
       self.section_cache[name] = self.section_decorator(name, section_fn, **kwargs)
     return self.section_cache[name]
 
-  def section_names(self) -> list[str]:
+  def section_names(self) -> list[SectionName]:
     return list(self.section_cache.keys())
 
 
@@ -79,6 +93,16 @@ def set_context(ctx: MmppContext):
     _mmpp_context = old_ctx
 
 
+def is_jax_partial(x):
+  # We carefully separate jax Partials from their data, so that
+  # even when the function in the metadata changes due to re-tracing
+  # we can specify in and out shardings via flattened pytrees. In this
+  # setting the remaining Partials' pytree children are merely dummy
+  # values. This allows us to eliminate the Partials from the sharding
+  # prefix pytrees.
+  return x is None or isinstance(x, jax._src.tree_util.Partial)
+
+
 def sharding_extractor():
   def should_infer_sharding(x):
     try:
@@ -86,15 +110,6 @@ def sharding_extractor():
       return type(aval) is jax.core.ShapedArray
     except TypeError:
       return False
-
-  def is_jax_partial(x):
-    # We carefully separate jax Partials from their data, so that
-    # even when the function in the metadata changes due to re-tracing
-    # we can specify in and out shardings via flattened pytrees. In this
-    # setting the remaining Partials' pytree children are merely dummy
-    # values. This allows us to eliminate the Partials from the sharding
-    # prefix pytrees.
-    return x is None or isinstance(x, jax._src.tree_util.Partial)
 
   def store(shardings, index, sharding):
     shardings[index] = sharding
@@ -182,32 +197,55 @@ def pipelined(mesh, step_fn, example_inputs):
     section_name in in_shardings_thunk and section_name in out_shardings_thunk
     for section_name in ctx.section_names()
   )
-  in_shardings = {
+  section_in_shardings = {
     section_name: thunk()
     for section_name, thunk in in_shardings_thunk.items()
   }
-  out_shardings = {
+  section_out_shardings = {
     section_name: thunk()
     for section_name, thunk in out_shardings_thunk.items()
   }
   for section_name in ctx.section_names():
-    ins = jax.tree.map(lambda x: x.spec, in_shardings[section_name])
-    outs = jax.tree.map(lambda x: x.spec, out_shardings[section_name])
+    ins = jax.tree.map(lambda x: x.spec, section_in_shardings[section_name])
+    outs = jax.tree.map(lambda x: x.spec, section_out_shardings[section_name])
     print(f'  {section_name=}:\n\t{ins=}\n\t{outs=}\n')
 
   # Phase 2: Produce final jitted sections
   print('PHASE2')
 
+  def adjust_to_stage_mesh(stage_mesh, shardings):
+    def adjust_one(s):
+      assert isinstance(s, NamedSharding)
+      return NamedSharding(stage_mesh, s.spec, memory_kind=s.memory_kind)
+    return jax.tree.map(adjust_one, shardings)
+
   def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
     # TODO: donate_argnums? (-> saved_input_vjp to ensure we don't capture params?)
     # TODO: Drop unused inputs (and outputs)? (-> could also just split params?)
     # TODO: Rewrite shardings from stage0_mesh to the appropriate stage mesh
-    return jax.jit(
+    _, stage_index = section_name
+    stage_mesh = get_stage_mesh(mesh, stage_index)
+    in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
+    out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
+    jitted_section_fn = jax.jit(
         section_fn,
-        in_shardings=in_shardings[section_name],
-        out_shardings=out_shardings[section_name],
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
         static_argnums=static_argnums,
     )
+    @functools.wraps(jitted_section_fn)
+    def transfer_and_apply_stage(*args):
+      args = jax.tree.map(
+          lambda x, s: jax.device_put(x, device=s),
+          args,
+          in_shardings,
+          is_leaf=is_jax_partial,
+      )
+      with stage_mesh:
+        # jaxpr = jax.make_jaxpr(section_fn)(*args)
+        # print(jaxpr.jaxpr)
+        return jitted_section_fn(*args)
+    return transfer_and_apply_stage
 
   ctx = MmppContext(
     mesh=mesh,
