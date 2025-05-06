@@ -260,7 +260,9 @@ def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings,
   # Phase 2: Produce final jitted sections
   print('PHASE2')
 
-  def jit_with_shardings(section_name, section_fn, *, static_argnums=()):
+  def jit_with_shardings(
+      section_name, section_fn, *, static_argnums=None, donate_argnums=None
+  ):
     # TODO: donate_argnums? (-> saved_input_vjp to ensure we don't capture params?)
     # TODO: Drop unused inputs (and outputs)? (-> could also just split params?)
     _, stage_index = section_name
@@ -272,6 +274,7 @@ def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
         static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
     )
     @wraps(jitted_section_fn)
     def apply_stage(*args):

@@ -356,7 +356,7 @@ def with_vjp_pack(bwd):
   return wrapper
 
 
-def get_fwd_and_bwd(model, stage_index):
+def model_fwd_and_bwd(model, stage_index):
   num_stages = model.num_logical_stages
   fwd, bwd = fwd_and_bwd(
     partial(forward, model, stage_index),
@@ -390,10 +390,15 @@ def init_stage_grads(param_infos, stage_index):
   return jax.tree.map(zeros_like_param, param_infos)
 
 
-def bwd_and_acc(bwd, stashed, params, out_cot, grads_acc):
-  grads, in_cot = bwd(stashed, params, out_cot)
+def fwd_stage(fwd, params, input_activations, data, rng):
+  res = fwd(params, input_activations, data, rng)
+  return params, *res
+
+
+def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
+  grads, in_cot = bwd(stashed, out_cot, params)
   grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
-  return grads_acc, in_cot
+  return params, grads_acc, in_cot
 
 
 def update_stage_state(tx, params, opt_state, grads):
@@ -407,11 +412,11 @@ def update_stage_state(tx, params, opt_state, grads):
 def get_section_fns(model, state_by_stage) -> dict[mmpp.SectionName, Callable]:
   section_fns = {}
   for stage_index, state in enumerate(state_by_stage):
-    fwd, bwd = get_fwd_and_bwd(model, stage_index)
+    fwd, bwd = model_fwd_and_bwd(model, stage_index)
     param_infos = jax.tree.map(lambda x: ParamInfo(x.shape, x.dtype, x.sharding), state.params)
     section_fns[(mmpp.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
-    section_fns[(mmpp.SectionKind.Forward, stage_index)] = fwd
-    section_fns[(mmpp.SectionKind.Backward, stage_index)] = partial(bwd_and_acc, bwd)
+    section_fns[(mmpp.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
+    section_fns[(mmpp.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
     section_fns[(mmpp.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
   return section_fns
 
@@ -543,6 +548,8 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   tasks.sort(key=task_key)
 
   ### State
+  # params_by_stage : stage_idx -> params
+  params_by_stage = list(params_by_stage)
   # fwd_input : (mubatch_idx, stage_idx) -> input/activation
   # TODO: Actually slice the input data into separate microbatches
   fwd_input = {
@@ -553,7 +560,6 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   stashed = {}
   # bwd_input : (mubatch_idx, stage_idx) -> activation
   bwd_input = {
-    # (mubatch_idx, num_stages-1): _mpmd_constant(stages[-1], P(), shape=(), value=1.0)
     (mubatch_idx, num_stages-1): 1.0
     for mubatch_idx in range(num_mubatches)
   }
@@ -565,7 +571,6 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
       grads = _init_stage_grads()
     grads_by_stage.append(grads)
   # loss : mubatch_idx -> loss
-  # TODO: Add a leading mubatch dim to loss instead of making it a list
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
 
@@ -580,30 +585,38 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
       if not is_bwd:
         ### Forward
         succ_id = (mubatch_idx, stage_idx+1)
-        _fwd = ctx.section((mmpp.SectionKind.Forward, stage_idx))
+        _fwd = ctx.section(
+            (mmpp.SectionKind.Forward, stage_idx),
+            donate_argnums=(0,1,),
+        )
         res = _fwd(
             params_by_stage[stage_idx],
             fwd_input.pop(curr_id),
             transfer(stage_idx, data),  # TODO: only transfer where actually needed
             transfer(stage_idx, dropout_rng),
         )
+        params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
         if stage_idx == num_stages - 1:
-          loss[mubatch_idx], stashed[curr_id], aux[mubatch_idx] = res
+          loss[mubatch_idx] = activation
+          aux[mubatch_idx] = res[3]
         else:
-          activation, stashed[curr_id] = res
           with nvtx.annotate(
               f"Tx mub{mubatch_idx} {stage_idx}->{stage_idx+1}", color="yellow",
           ):
             fwd_input[succ_id] = transfer(stage_idx+1, activation)
-          del activation
+        del res
+        del activation
       else:
         ### Backward
         succ_id = (mubatch_idx, stage_idx-1)
-        _bwd = ctx.section((mmpp.SectionKind.Backward, stage_idx))
-        grads_by_stage[stage_idx], activation_cot = _bwd(
+        _bwd = ctx.section(
+            (mmpp.SectionKind.Backward, stage_idx),
+            donate_argnums=(0,1,2,3),
+        )
+        params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = _bwd(
+            params_by_stage[stage_idx],
             stashed.pop(curr_id),
             bwd_input.pop(curr_id),
-            params_by_stage[stage_idx],
             grads_by_stage[stage_idx],
         )
         if stage_idx-1 >= 0:
@@ -616,7 +629,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=0)
   loss = stack_mean(loss)
   aux = jax.tree.map(lambda *xs: stack_mean(xs), *aux)
-  return (loss, aux), grads_by_stage
+  return params_by_stage, grads_by_stage, (loss, aux)
 
 
 def profiled_step(fn):
@@ -650,11 +663,21 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
   num_stages = model.num_logical_stages
   num_mubatches = config.num_pipeline_microbatches
 
+  # TODO: Reshape data into microbatches, slice out right microbatch
+  # TODO: Replicate data and dropout_rng to all stages, process locally
+  # TODO: Also donate data slice and rng?
   data = transfer(0, data)
 
-  params_by_stage = [state.params for state in state_by_stage]
-  (loss, aux), grads_by_stage = value_and_grad(
+  # Note: value_and_grad donates params; the params_by_stage returned will merely be
+  # fresh jax.Arrays containing the same data.
+  params_by_stage = tuple(state.params for state in state_by_stage)
+  params_by_stage, grads_by_stage, (loss, aux) = value_and_grad(
       ctx, num_stages, num_mubatches, params_by_stage, data, dropout_rng)
+  state_by_stage = tuple(
+    state.replace(params=params)
+    for state, params in zip(state_by_stage, params_by_stage)
+  )
+
   new_state_by_stage = update_state(ctx, state_by_stage, grads_by_stage)
 
   scalar_metrics = {
