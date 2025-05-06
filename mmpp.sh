@@ -2,11 +2,14 @@
 PROFILE_CMD=""
 PROFILE_CMD="nsys profile --output mmpp_profile.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
 
+# USE_MMPP=false
+USE_MMPP=true
+
 # pip install --no-deps -e .
 
 # TODO: With attention=cudnn_flash_te we get an error in TE: `assert mask_dtype in [fp8]`
 
-$PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
+NVTE_FUSED_ATTN=1 $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     run_name=logdir \
     model_name=llama2-7b \
     steps=10 \
@@ -28,5 +31,5 @@ $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     dcn_tensor_parallelism=1 \
     ici_pipeline_parallelism=2 \
     dcn_pipeline_parallelism=1 \
-    attention=dot_product \
-    use_mmpp=true
+    attention=cudnn_flash_te \
+    use_mmpp=$USE_MMPP
