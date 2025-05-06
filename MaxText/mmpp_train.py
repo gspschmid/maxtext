@@ -305,17 +305,19 @@ def forward(
 
 
 def fwd_and_bwd(
-    fun: Callable, argnums: Sequence[int], has_aux: bool = False, jitted: bool = True,
+    fun: Callable, argnums: Sequence[int], caller_saved_among_argnums: Sequence[bool],
+    has_aux: bool = False, jitted: bool = True,
 ) -> tuple[Callable, Callable]:
   def fwd(*args, **kwargs):
     dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
     f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
     f_partial, dyn_args = argnums_partial(
         f, argnums, args, require_static_args_hashable=False)
-    return jax._src.api._vjp(f_partial, *dyn_args, has_aux=has_aux)
-    # return jax.experimental.si_vjp(f_partial, (False,) * len(dyn_args), *dyn_args, has_aux=has_aux)
-  def bwd(f_vjp, outgrad):
-    return f_vjp(outgrad)
+    return jax._src.api._saved_input_vjp(
+        f_partial, caller_saved_among_argnums, *dyn_args, has_aux=has_aux)
+  def bwd(f_vjp, *outgrad_and_saved):
+    assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
+    return f_vjp(*outgrad_and_saved)
   if jitted:
     fwd = jit(fwd)
     bwd = jit(bwd)
@@ -348,7 +350,7 @@ def with_vjp_unpack(fwd):
 def with_vjp_pack(bwd):
   @wraps(bwd)
   def wrapper(*args, **kwargs):
-    assert len(args) == 2
+    assert len(args) == 3
     args = tuple_update(args, 0, vjp_pack(args[0]))
     return bwd(*args, **kwargs)
   return wrapper
@@ -358,7 +360,10 @@ def get_fwd_and_bwd(model, stage_index):
   num_stages = model.num_logical_stages
   fwd, bwd = fwd_and_bwd(
     partial(forward, model, stage_index),
-    argnums=(0, 1),  # params and input activations
+    # Take vjp wrt params and input activations
+    argnums=(0, 1),
+    # Caller saves params (to avoid duplicating in vjp residuals)
+    caller_saved_among_argnums=(True, False,),
     has_aux=(stage_index == num_stages - 1),
     jitted=False,
   )
@@ -385,8 +390,8 @@ def init_stage_grads(param_infos, stage_index):
   return jax.tree.map(zeros_like_param, param_infos)
 
 
-def bwd_and_acc(bwd, stashed, out_cot, grads_acc):
-  grads, in_cot = bwd(stashed, out_cot)
+def bwd_and_acc(bwd, stashed, params, out_cot, grads_acc):
+  grads, in_cot = bwd(stashed, params, out_cot)
   grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
   return grads_acc, in_cot
 
@@ -598,6 +603,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
         grads_by_stage[stage_idx], activation_cot = _bwd(
             stashed.pop(curr_id),
             bwd_input.pop(curr_id),
+            params_by_stage[stage_idx],
             grads_by_stage[stage_idx],
         )
         if stage_idx-1 >= 0:
