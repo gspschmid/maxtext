@@ -811,6 +811,7 @@ def train_loop(config, state=None):
     print("Loaded compiled function!", flush=True)
   else:
     if config.use_mmpp:
+      print('SPLIT AND TRANSFER STATE')
       state, in_shard_train, out_shard_train = mmpp_train.split_and_transfer_state(
           mesh,
           model.num_logical_stages,

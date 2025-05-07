@@ -7,8 +7,6 @@ USE_MMPP=true
 
 # pip install --no-deps -e .
 
-# TODO: With attention=cudnn_flash_te we get an error in TE: `assert mask_dtype in [fp8]`
-
 NVTE_FUSED_ATTN=1 $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     run_name=logdir \
     model_name=llama2-7b \

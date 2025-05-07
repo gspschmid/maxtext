@@ -9,6 +9,7 @@ from flax import linen as nn
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from MaxText import common_types
@@ -522,6 +523,40 @@ def transfer_initial_rng(mesh, rng):
 
 ### Loop over stages and train step
 
+def dump_memory_usage_snapshot(state):
+  def jax_tree_size_bytes(tree):
+    size_bytes = 0
+    for leaf in jax.tree_util.tree_leaves(tree):
+      if isinstance(leaf, (jax.Array, np.ndarray)):
+        size_bytes += leaf.size * leaf.dtype.itemsize
+    return size_bytes
+
+  def gb(size_bytes):
+    return size_bytes / 1024**3
+
+  print("Memory usage:")
+  print("  by device:")
+  for device in jax.devices():
+    stats = device.memory_stats()
+    used = gb(stats["bytes_in_use"])
+    limit = gb(stats["bytes_limit"])
+    peak = gb(stats["peak_bytes_in_use"])
+    print(
+        f"    {device}: {used:7.01f}/{limit:7.01f}GB ({used/limit*100:4.1f}%)"
+        f"  |  peak {peak:7.01f}GB ({peak/limit*100:4.1f}%)"
+    )
+
+  print("  by known state:")
+  is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
+  flat_state, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=is_leaf)
+  total_size_bytes = 0
+  for path, value in flat_state:
+    size_bytes = jax_tree_size_bytes(value)
+    total_size_bytes += size_bytes
+    print(f"    state{jax.tree_util.keystr(path):24}: {gb(size_bytes):7.01f}GB")
+  print(f"  => total size                   : {gb(total_size_bytes):7.01f}GB")
+
+
 # TODO: When doing the first tracing (to infer shardings) only use num_mubatches==1
 # TODO: Make sure we only transfer inputs actually needed by a section
 def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropout_rng):
@@ -574,7 +609,23 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
 
+  def memory_usage_snapshot():
+    if ctx.tracing_for_inference:
+      return
+    state = {
+      "params_by_stage": params_by_stage,
+      "fwd_input": fwd_input,
+      "stashed": stashed,
+      "bwd_input": bwd_input,
+      "grads_by_stage": grads_by_stage,
+      "loss": loss,
+      "aux": aux,
+    }
+    jax.block_until_ready(state)
+    dump_memory_usage_snapshot(state)
+
   ### Microbatched forward+backward
+  memory_usage_snapshot()
   for mubatch_idx, stage_idx, is_bwd in tasks:
     fwd_bwd_str = "B" if is_bwd else "F"
     color = "blue" if is_bwd else "red"
@@ -625,6 +676,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
           ):
             bwd_input[succ_id] = transfer(stage_idx-1, activation_cot)
         del activation_cot
+    memory_usage_snapshot()
 
   stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=0)
   loss = stack_mean(loss)
