@@ -534,9 +534,11 @@ def dump_memory_usage_snapshot(state):
   def gb(size_bytes):
     return size_bytes / 1024**3
 
+  record = {}
+
   print("Memory usage:")
   print("  by device:")
-  for device in jax.devices():
+  for i, device in enumerate(jax.devices()):
     stats = device.memory_stats()
     used = gb(stats["bytes_in_use"])
     limit = gb(stats["bytes_limit"])
@@ -545,6 +547,9 @@ def dump_memory_usage_snapshot(state):
         f"    {device}: {used:7.01f}/{limit:7.01f}GB ({used/limit*100:4.1f}%)"
         f"  |  peak {peak:7.01f}GB ({peak/limit*100:4.1f}%)"
     )
+    record[f"device{i}_used_gb"] = used
+    record[f"device{i}_limit_gb"] = limit
+    record[f"device{i}_peak_gb"] = peak
 
   print("  by known state:")
   is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
@@ -554,7 +559,11 @@ def dump_memory_usage_snapshot(state):
     size_bytes = jax_tree_size_bytes(value)
     total_size_bytes += size_bytes
     print(f"    state{jax.tree_util.keystr(path):24}: {gb(size_bytes):7.01f}GB")
+    assert len(path) == 1 and isinstance(path[0], jax.tree_util.DictKey)
+    record[f"state_{path[0].key}_gb"] = gb(size_bytes)
   print(f"  => total size                   : {gb(total_size_bytes):7.01f}GB")
+
+  return record
 
 
 # TODO: When doing the first tracing (to infer shardings) only use num_mubatches==1
@@ -609,7 +618,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
 
-  def memory_usage_snapshot():
+  def memory_usage_snapshot(name):
     if ctx.tracing_for_inference:
       return
     state = {
@@ -622,10 +631,13 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
       "aux": aux,
     }
     jax.block_until_ready(state)
-    dump_memory_usage_snapshot(state)
+    record = dump_memory_usage_snapshot(state)
+    if name == "start":
+      print("MEM,name," + ",".join(k for k in sorted(record.keys())))
+    print(f"MEM,{name}," + ",".join(str(record[k]) for k in sorted(record.keys())))
 
   ### Microbatched forward+backward
-  memory_usage_snapshot()
+  memory_usage_snapshot("start")
   for mubatch_idx, stage_idx, is_bwd in tasks:
     fwd_bwd_str = "B" if is_bwd else "F"
     color = "blue" if is_bwd else "red"
@@ -676,7 +688,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
           ):
             bwd_input[succ_id] = transfer(stage_idx-1, activation_cot)
         del activation_cot
-    memory_usage_snapshot()
+    memory_usage_snapshot(task_name)
 
   stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=0)
   loss = stack_mean(loss)
@@ -713,7 +725,7 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
 
   ctx = mmpp.get_context()
   num_stages = model.num_logical_stages
-  num_mubatches = config.num_pipeline_microbatches
+  num_mubatches = 1 if ctx.tracing_for_inference else config.num_pipeline_microbatches
 
   # TODO: Reshape data into microbatches, slice out right microbatch
   # TODO: Replicate data and dropout_rng to all stages, process locally
