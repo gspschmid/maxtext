@@ -568,7 +568,10 @@ def dump_memory_usage_snapshot(state):
 
 # TODO: When doing the first tracing (to infer shardings) only use num_mubatches==1
 # TODO: Make sure we only transfer inputs actually needed by a section
-def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropout_rng):
+def value_and_grad(
+    ctx, num_stages, num_mubatches, params_by_stage, data_by_stage, dropout_rng,
+    debug_memory_usage=False,
+):
   ### Schedule
   tasks = [
     (mubatch_idx, stage_idx, is_fwd)
@@ -595,7 +598,6 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   # params_by_stage : stage_idx -> params
   params_by_stage = list(params_by_stage)
   # fwd_input : (mubatch_idx, stage_idx) -> input/activation
-  # TODO: Actually slice the input data into separate microbatches
   fwd_input = {
     (mubatch_idx, 0): None
     for mubatch_idx in range(num_mubatches)
@@ -619,7 +621,7 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
   aux = [None] * num_mubatches
 
   def memory_usage_snapshot(name):
-    if ctx.tracing_for_inference:
+    if not debug_memory_usage or ctx.tracing_for_inference:
       return
     state = {
       "params_by_stage": params_by_stage,
@@ -650,12 +652,14 @@ def value_and_grad(ctx, num_stages, num_mubatches, params_by_stage, data, dropou
         succ_id = (mubatch_idx, stage_idx+1)
         _fwd = ctx.section(
             (mmpp.SectionKind.Forward, stage_idx),
-            donate_argnums=(0,1,),
+            donate_argnums=(0,1,2,),
         )
+        # TODO: Investigate whether slice and allocating outside the fwd is a bottleneck
+        mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data_by_stage[stage_idx])
         res = _fwd(
             params_by_stage[stage_idx],
             fwd_input.pop(curr_id),
-            transfer(stage_idx, data),  # TODO: only transfer where actually needed
+            mubatch_data,
             transfer(stage_idx, dropout_rng),
         )
         params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
@@ -727,16 +731,24 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
   num_stages = model.num_logical_stages
   num_mubatches = 1 if ctx.tracing_for_inference else config.num_pipeline_microbatches
 
-  # TODO: Reshape data into microbatches, slice out right microbatch
-  # TODO: Replicate data and dropout_rng to all stages, process locally
-  # TODO: Also donate data slice and rng?
-  data = transfer(0, data)
+  # TODO: Investigate whether this replication and resharding is a bottleneck
+  def reshape_reshard_data(arr):
+    arr = arr.reshape((num_mubatches, -1, *arr.shape[1:]))
+    return nn.with_logical_constraint(arr, (None, "activation_batch",))
+  data = jax.tree.map(reshape_reshard_data, data)
+  data_by_stage = tuple(
+    transfer(stage_index, data)  # replicate, it's (relatively) cheap and might overlap?
+    for stage_index in range(num_stages)
+  )
+  del data
+
+  # TODO: Also replicate dropout_rng to all stages and donate?
 
   # Note: value_and_grad donates params; the params_by_stage returned will merely be
   # fresh jax.Arrays containing the same data.
   params_by_stage = tuple(state.params for state in state_by_stage)
   params_by_stage, grads_by_stage, (loss, aux) = value_and_grad(
-      ctx, num_stages, num_mubatches, params_by_stage, data, dropout_rng)
+      ctx, num_stages, num_mubatches, params_by_stage, data_by_stage, dropout_rng)
   state_by_stage = tuple(
     state.replace(params=params)
     for state, params in zip(state_by_stage, params_by_stage)
