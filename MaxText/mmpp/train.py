@@ -1,9 +1,9 @@
-"""Training harness for mmpp.
+"""Training step and state management for mmpp.
 Primarily concerned with data placement, transfers and pipelining."""
 
 import dataclasses
-from functools import partial, wraps
-from typing import Any, Callable, Sequence
+from functools import partial
+from typing import Any, Callable
 
 from flax import linen as nn
 from flax.training import train_state
@@ -14,74 +14,12 @@ import optax
 
 from MaxText.mmpp import models
 from MaxText.mmpp import mpmd
-
-# Profiling imports
-from ctypes import cdll
-libcudart = cdll.LoadLibrary('libcudart.so')
-import nvtx
-
-# vjp-related utils imports
-from jax._src import linear_util as lu
-from jax._src.api_util import argnums_partial, debug_info
-from jax._src.tree_util import Partial
-from jax._src.util import tuple_update
-
-
-def fwd_and_bwd(
-    fun: Callable, argnums: Sequence[int], caller_saved_among_argnums: Sequence[bool],
-    has_aux: bool = False, jitted: bool = True,
-) -> tuple[Callable, Callable]:
-  def fwd(*args, **kwargs):
-    dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
-    f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
-    f_partial, dyn_args = argnums_partial(
-        f, argnums, args, require_static_args_hashable=False)
-    return jax._src.api._saved_input_vjp(
-        f_partial, caller_saved_among_argnums, *dyn_args, has_aux=has_aux)
-  def bwd(f_vjp, *outgrad_and_saved):
-    assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
-    return f_vjp(*outgrad_and_saved)
-  if jitted:
-    fwd = jit(fwd)
-    bwd = jit(bwd)
-  return fwd, bwd
-
-
-def vjp_unpack(f_vjp):
-  assert isinstance(f_vjp, Partial)
-  flat_data, tree = jax.tree.flatten(f_vjp)
-  # NB: Don't use None as the dummy value!
-  dataless_vjp = jax.tree.unflatten(tree, [123] * len(flat_data))
-  return (flat_data, dataless_vjp)
-
-def vjp_pack(f_vjp_unpacked):
-  assert isinstance(f_vjp_unpacked, tuple)
-  flat_data, dataless_vjp = f_vjp_unpacked
-  dummy_flat_data, tree = jax.tree.flatten(dataless_vjp)
-  assert len(dummy_flat_data) == len(flat_data)
-  f_vjp = jax.tree.unflatten(tree, flat_data)
-  return f_vjp
-
-def with_vjp_unpack(fwd):
-  @wraps(fwd)
-  def wrapper(*args, **kwargs):
-    out = fwd(*args, **kwargs)
-    assert 2 <= len(out) <= 3
-    return tuple_update(out, 1, vjp_unpack(out[1]))
-  return wrapper
-
-def with_vjp_pack(bwd):
-  @wraps(bwd)
-  def wrapper(*args, **kwargs):
-    assert len(args) == 3
-    args = tuple_update(args, 0, vjp_pack(args[0]))
-    return bwd(*args, **kwargs)
-  return wrapper
+from MaxText.mmpp import utils
 
 
 def model_fwd_and_bwd(model, stage_index):
   num_stages = model.num_logical_stages
-  fwd, bwd = fwd_and_bwd(
+  fwd, bwd = utils.fwd_and_bwd(
     partial(models.forward, model, stage_index),
     # Take vjp wrt params and input activations
     argnums=(0, 1),
@@ -92,8 +30,8 @@ def model_fwd_and_bwd(model, stage_index):
   )
   fwd.__name__ = f"forward{stage_index}"
   bwd.__name__ = f"backward{stage_index}"
-  fwd = with_vjp_unpack(fwd)
-  bwd = with_vjp_pack(bwd)
+  fwd = utils.with_vjp_unpack(fwd)
+  bwd = utils.with_vjp_pack(bwd)
   return fwd, bwd
 
 
@@ -169,7 +107,7 @@ def split_opt_state_by_stage(num_stages, opt_state):
   mu_by_stage = split_params_by_stage(num_stages, opt_state[0].mu)
   nu_by_stage = split_params_by_stage(num_stages, opt_state[0].nu)
   opt_state_by_stage = [
-    tuple_update(opt_state, 0, opt_state[0]._replace(mu=mu, nu=nu))
+    utils.tuple_update(opt_state, 0, opt_state[0]._replace(mu=mu, nu=nu))
     for mu, nu in zip(mu_by_stage, nu_by_stage)
   ]
   return tuple(opt_state_by_stage)
@@ -197,7 +135,7 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
       zip(old_state_by_stage, grads_by_stage, strict=True)):
     params, opt_state = old_state.params, old_state.opt_state
     _update_stage_state = ctx.section((mpmd.SectionKind.Epilogue, stage_index))
-    with nvtx.annotate(f"update{stage_index}", color="green"):
+    with utils.annotate(f"update{stage_index}", color="green"):
       new_params, new_opt_state = _update_stage_state(params, opt_state, grads)
     new_state_by_stage.append(
         old_state.replace(
@@ -238,50 +176,7 @@ def split_and_transfer_state(mesh, num_stages, state, in_shard_train, out_shard_
   return state_by_stage, in_shard_train, out_shard_train
 
 
-### Loop over stages and train step
-
-def dump_memory_usage_snapshot(state):
-  def jax_tree_size_bytes(tree):
-    size_bytes = 0
-    for leaf in jax.tree_util.tree_leaves(tree):
-      if isinstance(leaf, (jax.Array, np.ndarray)):
-        size_bytes += leaf.size * leaf.dtype.itemsize
-    return size_bytes
-
-  def gb(size_bytes):
-    return size_bytes / 1024**3
-
-  record = {}
-
-  print("Memory usage:")
-  print("  by device:")
-  for i, device in enumerate(jax.devices()):
-    stats = device.memory_stats()
-    used = gb(stats["bytes_in_use"])
-    limit = gb(stats["bytes_limit"])
-    peak = gb(stats["peak_bytes_in_use"])
-    print(
-        f"    {device}: {used:7.01f}/{limit:7.01f}GB ({used/limit*100:4.1f}%)"
-        f"  |  peak {peak:7.01f}GB ({peak/limit*100:4.1f}%)"
-    )
-    record[f"device{i}_used_gb"] = used
-    record[f"device{i}_limit_gb"] = limit
-    record[f"device{i}_peak_gb"] = peak
-
-  print("  by known state:")
-  is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
-  flat_state, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=is_leaf)
-  total_size_bytes = 0
-  for path, value in flat_state:
-    size_bytes = jax_tree_size_bytes(value)
-    total_size_bytes += size_bytes
-    print(f"    state{jax.tree_util.keystr(path):24}: {gb(size_bytes):7.01f}GB")
-    assert len(path) == 1 and isinstance(path[0], jax.tree_util.DictKey)
-    record[f"state_{path[0].key}_gb"] = gb(size_bytes)
-  print(f"  => total size                   : {gb(total_size_bytes):7.01f}GB")
-
-  return record
-
+### Train step
 
 # TODO: Make sure we only transfer inputs actually needed by a section
 def value_and_grad(
@@ -331,7 +226,7 @@ def value_and_grad(
   grads_by_stage = []
   for stage_idx in range(num_stages):
     _init_stage_grads = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
-    with nvtx.annotate(f"init_grads{stage_idx}", color="green"):
+    with utils.annotate(f"init_grads{stage_idx}", color="green"):
       grads = _init_stage_grads()
     grads_by_stage.append(grads)
   # loss : mubatch_idx -> loss
@@ -363,7 +258,7 @@ def value_and_grad(
     color = "blue" if is_bwd else "red"
     task_name = f"mub{mubatch_idx}/{fwd_bwd_str}{stage_idx}"
     print(f"TASK {task_name}")
-    with nvtx.annotate(task_name, color=color):
+    with utils.annotate(task_name, color=color):
       curr_id = (mubatch_idx, stage_idx)
       if not is_bwd:
         ### Forward
@@ -385,7 +280,7 @@ def value_and_grad(
           loss[mubatch_idx] = activation
           aux[mubatch_idx] = res[3]
         else:
-          with nvtx.annotate(
+          with utils.annotate(
               f"Tx mub{mubatch_idx} {stage_idx}->{stage_idx+1}", color="yellow",
           ):
             fwd_input[succ_id] = transfer(stage_idx+1, activation)
@@ -405,7 +300,7 @@ def value_and_grad(
             grads_by_stage[stage_idx],
         )
         if stage_idx-1 >= 0:
-          with nvtx.annotate(
+          with utils.annotate(
               f"Tx mub{mubatch_idx} {stage_idx}->{stage_idx-1}", color="orange",
           ):
             bwd_input[succ_id] = transfer(stage_idx-1, activation_cot)
@@ -418,23 +313,7 @@ def value_and_grad(
   return params_by_stage, grads_by_stage, (loss, aux)
 
 
-def profiled_step(fn):
-  step, profile_start, profile_end = 0, 4, 6
-  @wraps(fn)
-  def wrapper(*args, **kwargs):
-    nonlocal step
-    if step == profile_start:
-      libcudart.cudaProfilerStart()
-    with nvtx.annotate(f"step{step}", color="white"):
-      res = fn(*args, **kwargs)
-    if step == profile_end:
-      libcudart.cudaProfilerStop()
-    step += 1
-    return res
-  return wrapper
-
-
-@profiled_step
+@utils.annotate_step
 def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropout_rng):
   assert config is model.config
   assert not config.gradient_clipping_threshold > 0
