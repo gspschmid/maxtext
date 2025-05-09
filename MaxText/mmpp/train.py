@@ -520,11 +520,6 @@ def split_and_transfer_state(mesh, num_stages, state, in_shard_train, out_shard_
   return state_by_stage, in_shard_train, out_shard_train
 
 
-def transfer_initial_rng(mesh, rng):
-  from jax.sharding import NamedSharding, PartitionSpec
-  return jax.device_put(rng, device=NamedSharding(mesh, PartitionSpec()))
-
-
 ### Loop over stages and train step
 
 def dump_memory_usage_snapshot(state):
@@ -570,12 +565,13 @@ def dump_memory_usage_snapshot(state):
   return record
 
 
-# TODO: When doing the first tracing (to infer shardings) only use num_mubatches==1
 # TODO: Make sure we only transfer inputs actually needed by a section
 def value_and_grad(
     ctx, num_stages, num_mubatches, params_by_stage, data_by_stage, dropout_rng,
     print_memory_usage=False,
 ):
+  assert num_stages == len(params_by_stage) == len(data_by_stage)
+
   ### Schedule
   tasks = [
     (mubatch_idx, stage_idx, is_fwd)
@@ -770,3 +766,37 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
       "scalars": {},
   }
   return new_state_by_stage, metrics
+
+
+def prepare_state_and_train_step(
+    mesh,
+    model,
+    state,
+    init_rng,
+    functional_train,
+    in_shard_train,
+    out_shard_train,
+    example_data,
+):
+  state, in_shard_train, out_shard_train = split_and_transfer_state(
+      mesh,
+      model.num_logical_stages,
+      state,
+      in_shard_train,
+      out_shard_train,
+  )
+
+  # Replicate init_rng
+  from jax.sharding import NamedSharding, PartitionSpec
+  init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))
+
+  p_train_step = mpmd.transform(
+      mesh,
+      get_section_fns(model, state),
+      functional_train,
+      in_shard_train,
+      out_shard_train,
+      (state, example_data, init_rng),
+  )
+
+  return state, init_rng, p_train_step

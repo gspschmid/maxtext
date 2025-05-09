@@ -59,7 +59,6 @@ from MaxText.layers import models
 
 from MaxText.gcp_workload_monitor import GCPWorkloadMonitor
 
-from MaxText.mmpp import mpmd as mmpp_mpmd
 from MaxText.mmpp import train as mmpp_train
 
 import jax.numpy as jnp
@@ -811,33 +810,15 @@ def train_loop(config, state=None):
     print("Loaded compiled function!", flush=True)
   else:
     if config.use_mmpp:
-      # (
-      #   state, init_rng, p_train_step, in_shard_train, out_shard_train,
-      # ) = mmpp_train.prepare_state_and_train_step(
-      #     model,
-      #     state,
-      #     init_rng,
-      #     functional_train,
-      #     in_shard_train,
-      #     out_shard_train,
-      #     (state, next(data_iterator), init_rng),
-      # )
-      print('SPLIT AND TRANSFER STATE')
-      state, in_shard_train, out_shard_train = mmpp_train.split_and_transfer_state(
+      state, init_rng, p_train_step = mmpp_train.prepare_state_and_train_step(
           mesh,
-          model.num_logical_stages,
+          model,
           state,
-          in_shard_train,
-          out_shard_train,
-      )
-      init_rng = mmpp_train.transfer_initial_rng(mesh, init_rng)
-      p_train_step = mmpp_mpmd.transform(
-          mesh,
-          mmpp_train.get_section_fns(model, state),
+          init_rng,
           functional_train,
           in_shard_train,
           out_shard_train,
-          (state, next(data_iterator), init_rng),
+          next(data_iterator),
       )
     else:
       p_train_step = jax.jit(
