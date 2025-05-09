@@ -59,7 +59,7 @@ from MaxText.layers import models
 
 from MaxText.gcp_workload_monitor import GCPWorkloadMonitor
 
-from MaxText.mmpp import train as mmpp_train
+from MaxText import mmpp
 
 import jax.numpy as jnp
 from jax import random
@@ -603,7 +603,7 @@ def setup_mesh_and_model(config, devices=None):
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
   if config.use_mmpp:
-    model = mmpp_train.Transformer(config, mesh, quant)
+    model = mmpp.Transformer(config, mesh, quant)
   else:
     model = Transformer(config, mesh, quant=quant)
   learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
@@ -769,7 +769,7 @@ def train_loop(config, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
-  _train_step = mmpp_train.train_step if config.use_mmpp else train_step
+  _train_step = mmpp.train_step if config.use_mmpp else train_step
 
   # pylint: disable=line-too-long
   (
@@ -810,7 +810,7 @@ def train_loop(config, state=None):
     print("Loaded compiled function!", flush=True)
   else:
     if config.use_mmpp:
-      state, init_rng, p_train_step = mmpp_train.prepare_state_and_train_step(
+      state, init_rng, p_train_step = mmpp.prepare_state_and_train_step(
           mesh,
           model,
           state,
