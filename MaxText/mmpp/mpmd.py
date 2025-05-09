@@ -1,4 +1,8 @@
-"""Non-model-specific code for mmpp."""
+"""Infrastructure for MPMD execution of a model broken into explicit stages.
+Provides APIs to annotate distinct sections of the model where each section will be
+executed in an SPMD fashion. Automatically infers shardings at each section boundary
+by first compiling the entire model on a single stage's mesh and extracting the
+usual SPMD shardings inferred by JAX/XLA."""
 
 import contextlib
 import dataclasses
@@ -37,17 +41,17 @@ StageIndex = int
 SectionName = tuple[SectionKind, StageIndex]
 
 
-# MmppContext provides the state for correctly transforming mmpp stages.
+# Context provides the state for correctly transforming mmpp stages.
 # We effectively execute the MmppTransformer in three variants:
 #  1. The usual Flax way, entering via __call__. We only use this for model.init.
-#  2. A first pass in mmpp.pipelined to infer shardings and other metadata.
-#  3. A second pass in mmpp.pipelined to compile the stages separately.
-# As part of these steps, MmppContext modifies which mesh is used and whether
+#  2. A first pass in mmpp.mpmd.transform to infer shardings and other metadata.
+#  3. A second pass in mmpp.mpmd.transform to compile the stages separately.
+# As part of these steps, Context modifies which mesh is used and whether
 # the model is broken into separate jax.jits. In particular, 1. and 2. use only
 # stage 0's mesh, but compile everything in a single jax.jit. Step 3. compiles
 # wrap's each stage in separate jax.jit and uses the appropriate meshes.
 @dataclasses.dataclass(frozen=True)
-class MmppContext:
+class Context:
   mesh: Mesh
   tracing_for_inference: bool
   section_fns: dict[SectionName, Callable] = dataclasses.field(default_factory=dict)
@@ -74,16 +78,16 @@ class MmppContext:
     return list(self.section_fns.keys())
 
 
-_mmpp_context: Optional[MmppContext] = None
+_mmpp_context: Optional[Context] = None
 
-def get_context() -> MmppContext:
+def get_context() -> Context:
   assert _mmpp_context is not None, \
-    'MmppContext unavailable. Are you calling from outside mmpp.pipelined?'
+    'Context unavailable. Are you calling from outside mmpp.mpmd.transform?'
   return _mmpp_context
 
-def get_context_or_fallback(mesh) -> MmppContext:
+def get_context_or_fallback(mesh) -> Context:
   if _mmpp_context is None:
-    return MmppContext(
+    return Context(
         mesh=mesh,
         tracing_for_inference=True,
         section_fns={},
@@ -92,7 +96,7 @@ def get_context_or_fallback(mesh) -> MmppContext:
   return _mmpp_context
 
 @contextlib.contextmanager
-def set_context(ctx: MmppContext):
+def set_context(ctx: Context):
   global _mmpp_context
   old_ctx = _mmpp_context
   _mmpp_context = ctx
@@ -204,7 +208,10 @@ def check_args_mesh(name, stage_mesh, args):
     )
 
 
-def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings, example_inputs):
+def transform(
+    mesh, section_fns, step_fn, step_in_shardings, step_out_shardings, example_inputs,
+    print_inferred_shardings=False,
+):
   # Phase 1: Infer shardings
   print('PHASE1')
 
@@ -224,7 +231,7 @@ def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings,
         sharding=sharding_with_mesh(arr.sharding, stage0_mesh),
     )
 
-  ctx = MmppContext(
+  ctx = Context(
     mesh=mesh,
     tracing_for_inference=True,
     section_fns=section_fns,
@@ -252,10 +259,12 @@ def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings,
   }
   del in_shardings_thunk
   del out_shardings_thunk
-  # for section_name in ctx.section_names():
-  #   ins = jax.tree.map(lambda x: x.spec, section_in_shardings[section_name])
-  #   outs = jax.tree.map(lambda x: x.spec, section_out_shardings[section_name])
-  #   print(f'  {section_name}:\n\t{ins=}\n\t{outs=}\n')
+
+  if print_inferred_shardings:
+    for section_name in ctx.section_names():
+      ins = jax.tree.map(lambda x: x.spec, section_in_shardings[section_name])
+      outs = jax.tree.map(lambda x: x.spec, section_out_shardings[section_name])
+      print(f'  {section_name}:\n\t{ins=}\n\t{outs=}\n')
 
   # Phase 2: Produce final jitted sections
   print('PHASE2')
@@ -281,7 +290,7 @@ def pipelined(mesh, section_fns, step_fn, step_in_shardings, step_out_shardings,
         return jitted_section_fn(*args)
     return apply_stage
 
-  ctx = MmppContext(
+  ctx = Context(
     mesh=mesh,
     tracing_for_inference=False,
     section_fns=section_fns,

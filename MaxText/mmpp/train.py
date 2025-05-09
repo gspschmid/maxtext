@@ -19,7 +19,7 @@ from MaxText.layers import models
 from MaxText.layers import quantizations
 
 from MaxText import max_utils
-from MaxText import mmpp
+from MaxText.mmpp import mpmd
 
 # Profiling imports
 from ctypes import cdll
@@ -45,7 +45,7 @@ EPS = 1e-8
 
 ### The flax model definition
 
-class MmppTransformer(nn.Module):
+class Transformer(nn.Module):
   """Transformer, specialized for mmpp."""
   config: Config
   mesh: Mesh
@@ -99,7 +99,7 @@ class MmppTransformer(nn.Module):
 
   def get_pipeline_stage_module(self, stage_index, base_stage, num_layers_in_stage):
     cfg = self.config
-    stage_mesh = mmpp.get_context_or_fallback(self.mesh).get_stage_mesh(stage_index)
+    stage_mesh = mpmd.get_context_or_fallback(self.mesh).get_stage_mesh(stage_index)
     name = f"stage{stage_index}_layers"
     if num_layers_in_stage == 1:
       stage_module = base_stage(config=cfg, mesh=stage_mesh, quant=self.quant, name=name)
@@ -216,7 +216,7 @@ class MmppTransformer(nn.Module):
 
     return y
 
-  # NOTE: This path is used to initialize the model state.
+  # NOTE: This path is only used to initialize the model state.
   @nn.compact
   def __call__(
       self,
@@ -230,7 +230,11 @@ class MmppTransformer(nn.Module):
       true_length: Optional[int] = None,
       slot: Optional[int] = None,
   ):
-    """The transformer implemented in the usual flax way (unusable for mmpp)."""
+    """
+    The transformer implemented in the usual flax way. Note that this is needed for
+    model state initialization, but not in mmpp execution to work around flax's implicit
+    state management.
+    """
     assert enable_dropout == False  # ~> deterministic = True
     assert model_mode == common_types.MODEL_MODE_TRAIN
     del encoder_images
@@ -270,7 +274,7 @@ def loss_and_aux_from_logits(config, data, logits):
   return loss, aux
 
 
-### Define each stage's forward and backward as separate jittable functions
+### Define each stage's SPMD sections (grad init, forward, backward and grad update)
 
 def forward(
     model,
@@ -383,10 +387,10 @@ class ParamInfo:
 
 
 def init_stage_grads(param_infos, stage_index):
-  stage_mesh = mmpp.get_context().get_stage_mesh(stage_index)
+  stage_mesh = mpmd.get_context().get_stage_mesh(stage_index)
   def zeros_like_param(pi):
     zeros = jnp.zeros(pi.shape, dtype=pi.dtype)
-    sharding = mmpp.sharding_with_mesh(pi.sharding, stage_mesh)
+    sharding = mpmd.sharding_with_mesh(pi.sharding, stage_mesh)
     return jax.lax.with_sharding_constraint(zeros, sharding)
   return jax.tree.map(zeros_like_param, param_infos)
 
@@ -410,22 +414,22 @@ def update_stage_state(tx, params, opt_state, grads):
   return new_params, new_opt_state
 
 
-def get_section_fns(model, state_by_stage) -> dict[mmpp.SectionName, Callable]:
+def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
   section_fns = {}
   for stage_index, state in enumerate(state_by_stage):
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
     param_infos = jax.tree.map(lambda x: ParamInfo(x.shape, x.dtype, x.sharding), state.params)
-    section_fns[(mmpp.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
-    section_fns[(mmpp.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
-    section_fns[(mmpp.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
-    section_fns[(mmpp.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
+    section_fns[(mpmd.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
+    section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
+    section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
   return section_fns
 
 
 ### Managing flax and optax state
 
 def split_params_by_stage(num_stages, all_params):
-  # Assumption: no params are shared between stages; we specialize to MmppTransformer.
+  # Assumption: no params are shared between stages; we specialize to Transformer.
   params_by_stage = []
   _all_params = all_params["params"]
   for stage_index in range(num_stages):
@@ -474,7 +478,7 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
   for stage_index, (old_state, grads) in enumerate(
       zip(old_state_by_stage, grads_by_stage, strict=True)):
     params, opt_state = old_state.params, old_state.opt_state
-    _update_stage_state = ctx.section((mmpp.SectionKind.Epilogue, stage_index))
+    _update_stage_state = ctx.section((mpmd.SectionKind.Epilogue, stage_index))
     with nvtx.annotate(f'update{stage_index}', color='green'):
       new_params, new_opt_state = _update_stage_state(params, opt_state, grads)
     new_state_by_stage.append(
@@ -490,19 +494,19 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
 ### Transfer state and input data to the corresponding stages' meshes
 
 def transfer(stage_idx, xs):
-  ctx = mmpp.get_context()
+  ctx = mpmd.get_context()
   if ctx.tracing_for_inference:
     return xs
   stage_mesh = ctx.get_stage_mesh(stage_idx)
   def transfer_one(x):
-    sharding = mmpp.sharding_with_mesh(x.sharding, stage_mesh)
+    sharding = mpmd.sharding_with_mesh(x.sharding, stage_mesh)
     return jax.device_put(x, device=sharding)
   return jax.tree.map(transfer_one, xs)
 
 
 def split_and_transfer_state(mesh, num_stages, state, in_shard_train, out_shard_train):
   state_by_stage = split_state_by_stage(num_stages, state)
-  with mmpp.set_context(mmpp.MmppContext(mesh, tracing_for_inference=False)):
+  with mpmd.set_context(mpmd.Context(mesh, tracing_for_inference=False)):
     state_by_stage = tuple(
       transfer(stage_idx, state) for stage_idx, state in enumerate(state_by_stage)
     )
@@ -570,7 +574,7 @@ def dump_memory_usage_snapshot(state):
 # TODO: Make sure we only transfer inputs actually needed by a section
 def value_and_grad(
     ctx, num_stages, num_mubatches, params_by_stage, data_by_stage, dropout_rng,
-    debug_memory_usage=False,
+    print_memory_usage=False,
 ):
   ### Schedule
   tasks = [
@@ -612,7 +616,7 @@ def value_and_grad(
   # grads_by_stage : stage_idx -> grads
   grads_by_stage = []
   for stage_idx in range(num_stages):
-    _init_stage_grads = ctx.section((mmpp.SectionKind.Prologue, stage_idx))
+    _init_stage_grads = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
     with nvtx.annotate(f"init_grads{stage_idx}", color="green"):
       grads = _init_stage_grads()
     grads_by_stage.append(grads)
@@ -621,7 +625,7 @@ def value_and_grad(
   aux = [None] * num_mubatches
 
   def memory_usage_snapshot(name):
-    if not debug_memory_usage or ctx.tracing_for_inference:
+    if not print_memory_usage or ctx.tracing_for_inference:
       return
     state = {
       "params_by_stage": params_by_stage,
@@ -651,7 +655,7 @@ def value_and_grad(
         ### Forward
         succ_id = (mubatch_idx, stage_idx+1)
         _fwd = ctx.section(
-            (mmpp.SectionKind.Forward, stage_idx),
+            (mpmd.SectionKind.Forward, stage_idx),
             donate_argnums=(0,1,2,),
         )
         # TODO: Investigate whether slice and allocating outside the fwd is a bottleneck
@@ -677,7 +681,7 @@ def value_and_grad(
         ### Backward
         succ_id = (mubatch_idx, stage_idx-1)
         _bwd = ctx.section(
-            (mmpp.SectionKind.Backward, stage_idx),
+            (mpmd.SectionKind.Backward, stage_idx),
             donate_argnums=(0,1,2,3),
         )
         params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = _bwd(
@@ -727,7 +731,7 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
   assert not config.record_internal_nn_metrics
   assert not config.enable_dropout
 
-  ctx = mmpp.get_context()
+  ctx = mpmd.get_context()
   num_stages = model.num_logical_stages
   num_mubatches = 1 if ctx.tracing_for_inference else config.num_pipeline_microbatches
 

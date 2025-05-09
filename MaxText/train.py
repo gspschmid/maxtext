@@ -59,8 +59,8 @@ from MaxText.layers import models
 
 from MaxText.gcp_workload_monitor import GCPWorkloadMonitor
 
-from MaxText import mmpp
-from MaxText import mmpp_train
+from MaxText.mmpp import mpmd as mmpp_mpmd
+from MaxText.mmpp import train as mmpp_train
 
 import jax.numpy as jnp
 from jax import random
@@ -604,7 +604,7 @@ def setup_mesh_and_model(config, devices=None):
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
   if config.use_mmpp:
-    model = mmpp_train.MmppTransformer(config, mesh, quant)
+    model = mmpp_train.Transformer(config, mesh, quant)
   else:
     model = Transformer(config, mesh, quant=quant)
   learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
@@ -811,6 +811,17 @@ def train_loop(config, state=None):
     print("Loaded compiled function!", flush=True)
   else:
     if config.use_mmpp:
+      # (
+      #   state, init_rng, p_train_step, in_shard_train, out_shard_train,
+      # ) = mmpp_train.prepare_state_and_train_step(
+      #     model,
+      #     state,
+      #     init_rng,
+      #     functional_train,
+      #     in_shard_train,
+      #     out_shard_train,
+      #     (state, next(data_iterator), init_rng),
+      # )
       print('SPLIT AND TRANSFER STATE')
       state, in_shard_train, out_shard_train = mmpp_train.split_and_transfer_state(
           mesh,
@@ -820,7 +831,7 @@ def train_loop(config, state=None):
           out_shard_train,
       )
       init_rng = mmpp_train.transfer_initial_rng(mesh, init_rng)
-      p_train_step = mmpp.pipelined(
+      p_train_step = mmpp_mpmd.transform(
           mesh,
           mmpp_train.get_section_fns(model, state),
           functional_train,
