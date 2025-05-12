@@ -9,6 +9,7 @@ from flax import linen as nn
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 import numpy as np
 import optax
 
@@ -51,8 +52,9 @@ def init_stage_grads(param_infos, stage_index):
   return jax.tree.map(zeros_like_param, param_infos)
 
 
-def fwd_stage(fwd, params, input_activations, data, rng):
-  res = fwd(params, input_activations, data, rng)
+def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
+  mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
+  res = fwd(params, input_activations, mubatch_data, rng)
   return params, *res
 
 
@@ -148,6 +150,14 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
 
 
 ### Transfer state and input data to the corresponding stages' meshes
+
+def constant(stage_idx, const):
+  ctx = mpmd.get_context()
+  if ctx.tracing_for_inference:
+    return const
+  stage_mesh = ctx.get_stage_mesh(stage_idx)
+  return jax.device_put(const, device=NamedSharding(stage_mesh, PartitionSpec()))
+
 
 def transfer(stage_idx, xs):
   ctx = mpmd.get_context()
@@ -265,15 +275,14 @@ def value_and_grad(
         succ_id = (mubatch_idx, stage_idx+1)
         _fwd = ctx.section(
             (mpmd.SectionKind.Forward, stage_idx),
-            donate_argnums=(0,1,2,),
+            donate_argnums=(0,1,),
         )
-        # TODO: Investigate whether slice and allocating outside the fwd is a bottleneck
-        mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data_by_stage[stage_idx])
         res = _fwd(
             params_by_stage[stage_idx],
             fwd_input.pop(curr_id),
-            mubatch_data,
+            data_by_stage[stage_idx],
             transfer(stage_idx, dropout_rng),
+            constant(stage_idx, mubatch_idx),
         )
         params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
         if stage_idx == num_stages - 1:
@@ -384,7 +393,6 @@ def prepare_state_and_train_step(
   )
 
   # Replicate init_rng
-  from jax.sharding import NamedSharding, PartitionSpec
   init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))
 
   p_train_step = mpmd.transform(
