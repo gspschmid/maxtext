@@ -212,6 +212,86 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
+def patch_flax_linen_remat():
+  import functools
+  from collections.abc import Callable
+  import flax.core.lift as lift
+  from flax.core.scope import CollectionFilter, PRNGSequenceFilter
+
+  # Based on https://github.com/google/flax/blob/8e9f8ae3eaf9de14555906e5e6c4bb6d4449e50e/flax/core/lift.py#L1413
+  def checkpoint(
+    fn: Callable[..., Any],
+    variables: CollectionFilter = True,
+    rngs: PRNGSequenceFilter = True,
+    concrete: bool = False,
+    prevent_cse: bool = True,
+    static_argnums: int | tuple[int, ...] = (),
+    policy: Callable[..., bool] | None = None,
+  ) -> Callable[..., Any]:
+    def inner(scope_fn, repack_fn, variable_groups, rng_groups, *args, **kwargs):
+      # add 2 to each static_argnums because we add two initial arguments to rematted
+      static_argnums_ = jax.tree_util.tree_map(lambda x: x + 2, static_argnums)
+
+      # TODO: Don't hardcode flax_variables_only!
+      if prevent_cse == "flax_variables_only":
+        # prevent_cse_ ~ (variable_groups, rng_groups, *dyn_args)
+        num_static_args = 1 if isinstance(static_argnums_, int) else len(static_argnums_)
+        prevent_cse_ = (False, False) + (True,) * (len(args) - num_static_args)
+        if kwargs:
+          # NOTE: The tuple form of prevent_cse has an awkward contract: if only positional
+          # args are passed, prevent_cse is a tuple matching those positions. If any kwargs
+          # are passed, prevent_cse_ ~ (args, kwargs).
+          prevent_cse_ = (prevent_cse_, True)
+      else:
+        prevent_cse_ = prevent_cse
+
+      @functools.partial(
+        jax.remat,
+        concrete=concrete,
+        static_argnums=static_argnums_,
+        prevent_cse=prevent_cse_,
+        policy=policy,
+      )
+      @functools.wraps(fn)
+      def rematted(variable_groups, rng_groups, *args, **kwargs):
+        scope = scope_fn(variable_groups, rng_groups)
+        y = fn(scope, *args, **kwargs)
+        return y, repack_fn(scope)
+
+      return rematted(variable_groups, rng_groups, *args, **kwargs)
+
+    return lift.pack(
+      inner,
+      (variables,),
+      (variables,),
+      (rngs,),
+      name='remat',
+      enable_kwargs=True,
+    )
+
+  lift.checkpoint = lift.remat = checkpoint
+
+patch_flax_linen_remat()
+
+
+def apply_value_and_grad(loss_fn, model, config, data, dropout_rng, params, extra_dpo_args):
+  if not config.avoid_remat_barrier:
+    grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
+    return grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
+  else:
+    # Like value_and_grad(loss_fn, argnums=4, has_aux=True)(model, config, ...), but also inserts
+    # an opt-barrier between forward and backward, if requested via config.avoid_remat_barrier.
+    loss, f_vjp, aux = jax.vjp(
+      lambda params: loss_fn(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True),
+      params,
+      has_aux=True,
+    )
+    assert len(f_vjp.args_res) == 1  # the saved params
+    f_vjp.args_res, loss, aux = jax.lax.optimization_barrier((f_vjp.args_res, loss, aux))
+    grad, = f_vjp(jnp.ones_like(loss))
+    return (loss, aux), grad
+
+
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng):
   """
 
@@ -242,6 +322,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   params = state.params
 
   if config.gradient_accumulation_steps > 1:
+    assert not config.avoid_remat_barrier, "not implemented"
     loss, aux, raw_grads = gradient_accumulation_loss_and_grad(
         _loss_fn,
         config,
@@ -262,8 +343,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         extra_dpo_args = [reference_params]
     if config.shard_optimizer_over_data:
       params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
-    grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
-    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
+    # grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
+    # (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
+    (loss, aux), raw_grads = apply_value_and_grad(_loss_fn, model, config, data, dropout_rng, state.params, extra_dpo_args)
 
   raw_grads = jax.tree_util.tree_map(
       lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
@@ -422,6 +504,9 @@ def train_loop(config, recorder, state=None):
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
       prof.maybe_activate_profiler(step, state)
+
+      if step == start_step:
+        max_utils.print_mem_stats("Before first step")
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)

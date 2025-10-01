@@ -772,6 +772,10 @@ class RematAndOffload(BaseModel):
       RematPolicy.FULL.value,
       description="The rematerialization policy, trading off speed and memory.",
   )
+  avoid_remat_barrier: bool = Field(
+      False,
+      description="If True, remat opt-barriers exclude model params. This sometimes enables additional XLA optimizations.",
+  )
   remat_policy_for_vit: str = Field("minimal", description="Remat policy for multimodal model's vision encoder.")
   decoder_layer_input: RematLocation = Field(
       RematLocation.DEVICE, description="Remat policy for the decoder layer's input."
