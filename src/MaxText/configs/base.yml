@@ -857,5 +857,7 @@ projector_dropout_for_vit: 0.0
 # Example: "8,8" to use a 8x8 subgrid (64 chips) of a full pod (16x16) of trillium.
 subslice_shape: ""
 
+avoid_remat_barrier: ""  # "" (disabled) OR "params_only" OR "all"
+
 # NNX
 enable_nnx: false

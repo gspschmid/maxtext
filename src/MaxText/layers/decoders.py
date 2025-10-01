@@ -429,10 +429,23 @@ class Decoder(nn.Module):
         # Transform layer class before remat
         block_layer = nn.map_variables(block_layer, ["params"], move_to_device, mutable=True)
 
+      if self.config.scan_layers:
+        prevent_cse = False
+      else:
+        if self.config.avoid_remat_barrier == "all":
+          prevent_cse = False
+        elif self.config.avoid_remat_barrier == "params_only":
+          # HACK: We only want to exclude model state, but flax.linen.remat doesn't properly
+          #   support the non-boolean form of jax.remat's prevent_cse. For now we simply patch
+          #   flax to do the right thing for a special value.
+          prevent_cse = "flax_variables_only"
+        else:
+          prevent_cse = True
+
       # Apply remat policy to layer
       layer = nn.remat(
           block_layer,
-          prevent_cse=not self.config.scan_layers,
+          prevent_cse=prevent_cse,
           policy=policy,
           static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
       )
